@@ -26,7 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scaffold .ctx/GODMODE.tasks.yaml, memory-bank/, and AGENTS.md in a repo.
+    /// Scaffold .ctx/opavs/tasks.yaml, .ctx/opavs/memory-bank/, and AGENTS.md
+    /// in a repo.
     Init {
         #[arg(default_value = ".")]
         repo_root: PathBuf,
@@ -62,8 +63,9 @@ enum TasksAction {
     Validate,
     /// Set a task's status.
     SetStatus { id: String, status: String },
-    /// Merge an external GODMODE.tasks.yaml file into this repo's graph
-    /// (upsert by id; existing task status is preserved).
+    /// Merge an external GODMODE.tasks.yaml file (same schema, not the same
+    /// path/state convention) into this repo's graph (upsert by id; existing
+    /// task status is preserved).
     Import { path: PathBuf },
 }
 
@@ -129,18 +131,9 @@ fn main() -> Result<()> {
                 }
                 TasksAction::SetStatus { id, status } => {
                     let mut graph = store.load()?;
-                    let status = match status.as_str() {
-                        "todo" => TaskStatus::Todo,
-                        "in_progress" => TaskStatus::InProgress,
-                        "done" => TaskStatus::Done,
-                        other => bail!("invalid status: {other} (expected todo|in_progress|done)"),
-                    };
-                    let task = graph
-                        .tasks
-                        .iter_mut()
-                        .find(|t| t.id == id)
-                        .ok_or_else(|| anyhow::anyhow!("unknown task id: {id}"))?;
-                    task.status = status.clone();
+                    let status = TaskStatus::parse(&status).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    domain::set_status(&mut graph, &id, status.clone())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     store.save(&graph)?;
                     println!("{id} -> {status:?}");
                 }
@@ -149,7 +142,7 @@ fn main() -> Result<()> {
                     let base = store.load()?;
                     let merged = import::merge(&base, &incoming);
                     domain::validate(&merged).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let added = merged.tasks.len() - base.tasks.len();
+                    let added = import::added_count(&base, &incoming);
                     store.save(&merged)?;
                     println!(
                         "imported {} tasks from {} ({added} new, {} total)",
@@ -166,32 +159,41 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_guard() -> Result<()> {
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
-    let hook: serde_json::Value = serde_json::from_str(&input)?;
+/// What a PreToolUse hook call resolves to before any repo/phase lookup:
+/// either an immediate allow (tool/command opavs doesn't gate), or something
+/// that needs a repo root + phase to decide.
+#[derive(Debug, PartialEq, Eq)]
+enum GuardRequest {
+    Allow,
+    Check {
+        tool: String,
+        target_dir: String,
+        is_commit_or_push: bool,
+    },
+}
 
+/// Pure: parse a PreToolUse hook JSON payload into a `GuardRequest`. No I/O.
+fn parse_guard_request(hook: &serde_json::Value, session_cwd: &str) -> GuardRequest {
     let tool = hook.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-    let session_cwd = hook
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| env::var("PWD").unwrap_or_default());
 
-    let (target_dir, is_commit_or_push): (Option<String>, bool) = match tool {
+    match tool {
         "Edit" | "Write" => {
             let file_path = hook
                 .pointer("/tool_input/file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if file_path.is_empty() {
-                allow_and_exit();
+                return GuardRequest::Allow;
             }
-            let dir = PathBuf::from(file_path)
+            let target_dir = PathBuf::from(file_path)
                 .parent()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
-            (Some(dir), false)
+            GuardRequest::Check {
+                tool: tool.to_string(),
+                target_dir,
+                is_commit_or_push: false,
+            }
         }
         "Bash" => {
             let cmd = hook
@@ -199,55 +201,81 @@ fn run_guard() -> Result<()> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if !guard::command_touches_commit_or_push(cmd) {
-                allow_and_exit();
+                return GuardRequest::Allow;
             }
-            let target = extract_dash_c_target(cmd).unwrap_or_else(|| session_cwd.clone());
-            (Some(target), true)
+            let target_dir = extract_dash_c_target(cmd).unwrap_or_else(|| session_cwd.to_string());
+            GuardRequest::Check {
+                tool: tool.to_string(),
+                target_dir,
+                is_commit_or_push: true,
+            }
         }
-        _ => {
-            allow_and_exit();
-            (None, false)
-        }
+        _ => GuardRequest::Allow,
+    }
+}
+
+const ALLOW_JSON: &str = "{\"continue\": true}";
+
+/// Pure (given `resolve`): decide the JSON verdict to print for a hook call.
+/// `resolve` maps a target directory to `(repo_root, current_phase)` — the
+/// one impure lookup, injected so this function is unit-testable without
+/// touching the filesystem.
+fn evaluate_guard(
+    hook: &serde_json::Value,
+    session_cwd: &str,
+    resolve: impl Fn(&str) -> Option<(PathBuf, Phase)>,
+) -> String {
+    let request = parse_guard_request(hook, session_cwd);
+
+    let GuardRequest::Check {
+        tool,
+        target_dir,
+        is_commit_or_push,
+    } = request
+    else {
+        return ALLOW_JSON.to_string();
     };
 
-    let Some(target_dir) = target_dir else {
-        allow_and_exit();
-        return Ok(());
+    let Some((repo_root, phase)) = resolve(&target_dir) else {
+        return ALLOW_JSON.to_string();
     };
-
-    let Some(repo_root) = repo::resolve_repo_root(&PathBuf::from(&target_dir)) else {
-        allow_and_exit();
-        return Ok(());
-    };
-
-    let store = FsPhaseStore::new(&repo_root);
-    let phase = store.get().unwrap_or(Phase::Orient);
 
     match guard::decide(
-        tool,
+        &tool,
         is_commit_or_push,
         phase,
         &repo_root.display().to_string(),
     ) {
-        guard::Verdict::Allow => println!("{{\"continue\": true}}"),
-        guard::Verdict::Deny(reason) => {
-            let out = serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            });
-            println!("{out}");
-        }
+        guard::Verdict::Allow => ALLOW_JSON.to_string(),
+        guard::Verdict::Deny(reason) => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        })
+        .to_string(),
     }
-
-    Ok(())
 }
 
-fn allow_and_exit() {
-    println!("{{\"continue\": true}}");
-    std::process::exit(0);
+fn run_guard() -> Result<()> {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let hook: serde_json::Value = serde_json::from_str(&input)?;
+    let session_cwd = hook
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| env::var("PWD").unwrap_or_default());
+
+    let out = evaluate_guard(&hook, &session_cwd, |target_dir| {
+        let repo_root = repo::resolve_repo_root(&PathBuf::from(target_dir))?;
+        let phase = FsPhaseStore::new(&repo_root).get().unwrap_or(Phase::Orient);
+        Some((repo_root, phase))
+    });
+
+    println!("{out}");
+    Ok(())
 }
 
 /// Extract the path argument to a `git -C <path>` flag, if present.
@@ -272,5 +300,126 @@ mod tests {
     #[test]
     fn no_dash_c_target_returns_none() {
         assert_eq!(extract_dash_c_target("git commit -m x"), None);
+    }
+
+    fn edit_hook(file_path: &str) -> serde_json::Value {
+        serde_json::json!({"tool_name": "Edit", "tool_input": {"file_path": file_path}})
+    }
+
+    fn bash_hook(command: &str) -> serde_json::Value {
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}})
+    }
+
+    #[test]
+    fn parse_guard_request_edit_with_empty_path_allows() {
+        assert_eq!(
+            parse_guard_request(&edit_hook(""), "/cwd"),
+            GuardRequest::Allow
+        );
+    }
+
+    #[test]
+    fn parse_guard_request_edit_yields_check() {
+        let req = parse_guard_request(&edit_hook("/repo/src/main.rs"), "/cwd");
+        assert_eq!(
+            req,
+            GuardRequest::Check {
+                tool: "Edit".to_string(),
+                target_dir: "/repo/src".to_string(),
+                is_commit_or_push: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_guard_request_bash_non_commit_allows() {
+        assert_eq!(
+            parse_guard_request(&bash_hook("cargo test"), "/cwd"),
+            GuardRequest::Allow
+        );
+    }
+
+    #[test]
+    fn parse_guard_request_bash_commit_yields_check_with_dash_c_target() {
+        let req = parse_guard_request(&bash_hook("git -C /repo commit -m x"), "/cwd");
+        assert_eq!(
+            req,
+            GuardRequest::Check {
+                tool: "Bash".to_string(),
+                target_dir: "/repo".to_string(),
+                is_commit_or_push: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_guard_request_bash_commit_falls_back_to_session_cwd() {
+        let req = parse_guard_request(&bash_hook("git commit -m x"), "/session/cwd");
+        assert_eq!(
+            req,
+            GuardRequest::Check {
+                tool: "Bash".to_string(),
+                target_dir: "/session/cwd".to_string(),
+                is_commit_or_push: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_guard_request_unrelated_tool_allows() {
+        let hook = serde_json::json!({"tool_name": "Read"});
+        assert_eq!(parse_guard_request(&hook, "/cwd"), GuardRequest::Allow);
+    }
+
+    #[test]
+    fn parse_guard_request_missing_tool_name_allows() {
+        let hook = serde_json::json!({});
+        assert_eq!(parse_guard_request(&hook, "/cwd"), GuardRequest::Allow);
+    }
+
+    #[test]
+    fn evaluate_guard_allows_when_request_is_allow() {
+        let out = evaluate_guard(&bash_hook("cargo test"), "/cwd", |_| unreachable!());
+        assert_eq!(out, ALLOW_JSON);
+    }
+
+    #[test]
+    fn evaluate_guard_allows_when_resolve_finds_no_repo() {
+        let out = evaluate_guard(&edit_hook("/nowhere/file.rs"), "/cwd", |_| None);
+        assert_eq!(out, ALLOW_JSON);
+    }
+
+    #[test]
+    fn evaluate_guard_allows_edit_in_act_phase() {
+        let out = evaluate_guard(&edit_hook("/repo/src/main.rs"), "/cwd", |_| {
+            Some((PathBuf::from("/repo"), Phase::Act))
+        });
+        assert_eq!(out, ALLOW_JSON);
+    }
+
+    #[test]
+    fn evaluate_guard_denies_edit_outside_act_phase() {
+        let out = evaluate_guard(&edit_hook("/repo/src/main.rs"), "/cwd", |_| {
+            Some((PathBuf::from("/repo"), Phase::Orient))
+        });
+        assert!(out.contains("\"permissionDecision\":\"deny\""));
+        assert!(out.contains("ACT"));
+    }
+
+    #[test]
+    fn evaluate_guard_denies_commit_outside_ship_phase() {
+        let out = evaluate_guard(&bash_hook("git commit -m x"), "/cwd", |_| {
+            Some((PathBuf::from("/repo"), Phase::Act))
+        });
+        assert!(out.contains("\"permissionDecision\":\"deny\""));
+        assert!(out.contains("SHIP"));
+    }
+
+    #[test]
+    fn evaluate_guard_allows_commit_in_ship_phase() {
+        let out = evaluate_guard(&bash_hook("git commit -m x"), "/cwd", |_| {
+            Some((PathBuf::from("/repo"), Phase::Ship))
+        });
+        assert_eq!(out, ALLOW_JSON);
     }
 }

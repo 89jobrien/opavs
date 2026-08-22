@@ -26,6 +26,15 @@ pub fn merge(base: &TaskGraph, incoming: &TaskGraph) -> TaskGraph {
     merged
 }
 
+/// How many tasks `merge(base, incoming)` would add that aren't already in `base`.
+pub fn added_count(base: &TaskGraph, incoming: &TaskGraph) -> usize {
+    incoming
+        .tasks
+        .iter()
+        .filter(|t| !base.tasks.iter().any(|b| b.id == t.id))
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +91,41 @@ mod tests {
                 .iter()
                 .any(|t| t.id == "a" && t.status == TaskStatus::Done)
         );
+    }
+
+    #[test]
+    fn added_count_counts_only_new_ids() {
+        let base = TaskGraph {
+            tasks: vec![task("a", TaskStatus::Done, "a", &[])],
+        };
+        let incoming = TaskGraph {
+            tasks: vec![
+                task("a", TaskStatus::Todo, "a updated", &[]),
+                task("b", TaskStatus::Todo, "b", &[]),
+            ],
+        };
+        assert_eq!(added_count(&base, &incoming), 1);
+    }
+
+    #[test]
+    fn added_count_is_zero_for_empty_incoming() {
+        let base = TaskGraph { tasks: vec![] };
+        let incoming = TaskGraph { tasks: vec![] };
+        assert_eq!(added_count(&base, &incoming), 0);
+    }
+
+    #[test]
+    fn read_external_graph_missing_file_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(read_external_graph(&tmp.path().join("nope.yaml")).is_err());
+    }
+
+    #[test]
+    fn read_external_graph_malformed_yaml_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("bad.yaml");
+        std::fs::write(&path, "not: [valid, task, graph").unwrap();
+        assert!(read_external_graph(&path).is_err());
     }
 
     #[test]

@@ -35,6 +35,15 @@ opavs guard                # PreToolUse hook entrypoint: reads Claude Code hook
 the `ACT` phase and `git commit`/`git push` outside `SHIP`, scoped to any repo
 containing `.ctx/opavs/tasks.yaml`.
 
+**Fail-open by design outside opavs-enabled repos.** If the target directory
+has no `.ctx/opavs/tasks.yaml` anywhere in its ancestry (or the hook payload
+doesn't resolve to a target directory at all), `opavs guard` allows the call
+unconditionally — it only enforces inside repos that have opted in via
+`opavs init`. This is intentional (the hook must be safe to install
+globally), but it means a repo that's supposed to be gated and isn't will
+silently allow everything, not error. Verify `.ctx/opavs/tasks.yaml` exists
+before assuming a repo is under phase discipline.
+
 ### Task graph (optional companion)
 
 ```
