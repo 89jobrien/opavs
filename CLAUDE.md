@@ -27,6 +27,8 @@ Hexagonal (see `~/.claude/skills/writing-solid-rust`):
 - `src/import.rs` — reads an external `GODMODE.tasks.yaml` (same schema) and
   merges it into the repo's graph by id, preserving existing task status.
 - `src/main.rs` — composition root: clap CLI wiring subcommands to adapters.
+- `src/lib.rs` — re-exports the above modules so `tests/` and `fuzz/` can
+  link against the crate as a library; `main.rs` is a thin binary over it.
 
 ## Build & Test
 
@@ -36,11 +38,27 @@ cargo clippy --all-targets
 cargo test
 ```
 
-Per `~/.claude/skills/testing-philosophy`: pure domain/guard logic is
-unit-tested inline; adapters are unit-tested against `tempfile::tempdir()`
-(fast, no shared state). No property/fuzz tier yet — nothing here parses
-untrusted bytes or does unchecked arithmetic; add fuzzing if a
-`serde_yaml` parse path or raw-byte handling is introduced later.
+Per `~/.claude/skills/testing-philosophy`, all seven dimensions are in use:
+
+- Unit: pure domain/guard logic tested inline in `#[cfg(test)]` modules.
+- Property (`proptest`, dev-dep): `guard::command_touches_commit_or_push`
+  and `main::extract_dash_c_target`/`parse_guard_request` — hand-rolled
+  string/JSON parsers over inputs with no example-based test can fully cover.
+- Fuzz (`cargo-fuzz`, `fuzz/`): `fuzz/fuzz_targets/fuzz_import_yaml.rs`
+  drives `serde_yaml::from_str::<TaskGraph>` directly — `import::read_
+external_graph` parses a user-supplied `GODMODE.tasks.yaml` path, i.e.
+  untrusted bytes not authored by this tool. Run with
+  `cargo +nightly fuzz run fuzz_import_yaml -- -max_total_time=30`.
+  Seed corpus lives in `fuzz/corpus/fuzz_import_yaml/` — never delete it.
+- Conformance: `domain::conformance::{assert_phase_store_contract,
+assert_task_store_contract}` — shared suites run against every
+  `PhaseStore`/`TaskStore` impl (currently `FsPhaseStore`/`FsTaskStore` in
+  `adapters.rs`'s test module).
+- Integration (`assert_cmd`, dev-dep): `tests/cli.rs` exercises the
+  compiled binary end to end (init → phase → tasks → guard over real
+  stdin/stdout), catching composition-root wiring bugs unit tests can't see.
+- Regression: adapters.rs and import.rs each carry a malformed-YAML test —
+  keep adding one per bug fixed against either YAML parse path.
 
 ## Conventions
 

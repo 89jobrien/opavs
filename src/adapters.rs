@@ -113,4 +113,26 @@ mod tests {
         let store = FsTaskStore::new(tmp.path());
         assert!(store.load().unwrap().tasks.is_empty());
     }
+
+    #[test]
+    fn task_store_malformed_yaml_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = FsTaskStore::new(tmp.path());
+        let path = tmp.path().join(".ctx").join("opavs").join("tasks.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not: [valid, task, graph").unwrap();
+        assert!(store.load().is_err());
+    }
+
+    #[test]
+    fn fs_phase_store_satisfies_port_contract() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        crate::domain::conformance::assert_phase_store_contract(FsPhaseStore::new(tmp.path()));
+    }
+
+    #[test]
+    fn fs_task_store_satisfies_port_contract() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        crate::domain::conformance::assert_task_store_contract(FsTaskStore::new(tmp.path()));
+    }
 }

@@ -1,3 +1,19 @@
 /target
 .ctx/opavs/phase
 .ctx/.opavs-phase
+/fuzz/target
+/fuzz/artifacts
+# committing this trips the shared obfsck secret scanner's crates.io-registry
+# false positive (excluded for the root Cargo.lock, not nested ones)
+/fuzz/Cargo.lock
+
+# handoff-begin
+.ctx/*
+!.ctx/HANDOFF.*.yaml
+.ctx/HANDOFF.godmode.*.yaml
+.ctx/HANDOFF.*.state.json
+!.ctx/handoff.*.config.toml.example
+.ctx/HANDOFF.*.*.state.json
+.ctx/HANDOFF.hj.hj.state.json
+.ctx/.initialized
+# handoff-end

@@ -1,14 +1,8 @@
-mod adapters;
-mod domain;
-mod guard;
-mod import;
-mod init;
-mod repo;
-
-use adapters::{FsPhaseStore, FsTaskStore};
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use domain::{Phase, PhaseStore, TaskStatus, TaskStore};
+use opavs::adapters::{FsPhaseStore, FsTaskStore};
+use opavs::domain::{self, Phase, PhaseStore, TaskStatus, TaskStore};
+use opavs::{guard, import, init, repo};
 use std::env;
 use std::io::Read;
 use std::path::PathBuf;
@@ -421,5 +415,48 @@ mod tests {
             Some((PathBuf::from("/repo"), Phase::Ship))
         });
         assert_eq!(out, ALLOW_JSON);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// No arbitrary UTF-8 input may panic the extractor.
+        #[test]
+        fn extract_dash_c_target_never_panics(cmd in ".*") {
+            let _ = extract_dash_c_target(&cmd);
+        }
+
+        /// When "-C <target>" appears anywhere, it must be extracted verbatim,
+        /// regardless of what surrounds it.
+        #[test]
+        fn extracts_the_word_following_dash_c(
+            prefix in "[a-zA-Z ]{0,10}",
+            target in "[a-zA-Z0-9/_-]{1,10}",
+            suffix in "[a-zA-Z ]{0,10}"
+        ) {
+            let cmd = format!("{prefix} -C {target} {suffix}");
+            prop_assert_eq!(extract_dash_c_target(&cmd), Some(target));
+        }
+
+        /// Arbitrary JSON values must never panic hook parsing, regardless of
+        /// tool_name/tool_input shape.
+        #[test]
+        fn parse_guard_request_never_panics_on_arbitrary_shapes(
+            tool_name in prop::option::of("[a-zA-Z]{0,8}"),
+            command in prop::option::of(".*"),
+        ) {
+            let mut hook = serde_json::json!({});
+            if let Some(t) = tool_name {
+                hook["tool_name"] = serde_json::json!(t);
+            }
+            if let Some(c) = command {
+                hook["tool_input"] = serde_json::json!({"command": c});
+            }
+            let _ = parse_guard_request(&hook, "/cwd");
+        }
     }
 }

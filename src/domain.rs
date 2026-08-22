@@ -209,6 +209,70 @@ pub fn runnable_tasks(graph: &TaskGraph) -> Vec<&Task> {
         .collect()
 }
 
+/// Conformance suite for `PhaseStore` impls: every port implementation must
+/// satisfy these invariants, not just compile. Call from each adapter's own
+/// test module: `conformance::assert_phase_store_contract(SomeStore::new(..))`.
+#[cfg(test)]
+pub mod conformance {
+    use super::*;
+
+    pub fn assert_phase_store_contract(store: impl PhaseStore) {
+        assert_eq!(
+            store.get().expect("fresh store defaults to a phase"),
+            Phase::Orient,
+            "PhaseStore::get must default to Orient before any set()"
+        );
+        for phase in [
+            Phase::Orient,
+            Phase::Plan,
+            Phase::Act,
+            Phase::Verify,
+            Phase::Ship,
+        ] {
+            store.set(phase).expect("set must succeed for any Phase");
+            assert_eq!(
+                store.get().expect("get after set must succeed"),
+                phase,
+                "PhaseStore::get must return the most recently set() phase"
+            );
+        }
+    }
+
+    pub fn assert_task_store_contract(store: impl TaskStore) {
+        assert!(
+            store
+                .load()
+                .expect("load on unsaved store must succeed")
+                .tasks
+                .is_empty(),
+            "TaskStore::load must yield an empty graph before any save()"
+        );
+        let graph = TaskGraph {
+            tasks: vec![Task {
+                id: "conformance-task".into(),
+                description: "check the contract".into(),
+                status: TaskStatus::Todo,
+                depends_on: vec![],
+            }],
+        };
+        store.save(&graph).expect("save must succeed");
+        let loaded = store.load().expect("load after save must succeed");
+        assert_eq!(
+            loaded.tasks.len(),
+            1,
+            "TaskStore::load must round-trip the saved task count"
+        );
+        assert_eq!(loaded.tasks[0].id, "conformance-task");
+
+        let empty = TaskGraph::default();
+        store.save(&empty).expect("save must overwrite, not merge");
+        assert!(
+            store.load().expect("load after overwrite").tasks.is_empty(),
+            "TaskStore::save must overwrite whatever was saved before"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

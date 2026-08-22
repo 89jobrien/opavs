@@ -1,0 +1,9 @@
+tasks:
+  - id: a
+    status: done
+  - id: b
+    status: in_progress
+    depends_on: [a]
+  - id: c
+    status: todo
+    depends_on: [a, b]

@@ -148,3 +148,35 @@ mod tests {
         assert!(!command_touches_commit_or_push("echo commit push"));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// No arbitrary UTF-8 input may panic the classifier.
+        #[test]
+        fn command_touches_commit_or_push_never_panics(cmd in ".*") {
+            let _ = command_touches_commit_or_push(&cmd);
+        }
+
+        /// A command with no "git" token anywhere can never be flagged.
+        #[test]
+        fn commands_without_git_token_are_never_flagged(
+            words in prop::collection::vec("[a-zA-Z0-9_-]{1,10}", 0..8)
+        ) {
+            let cmd = words.join(" ");
+            prop_assume!(!words.iter().any(|w| w == "git"));
+            prop_assert!(!command_touches_commit_or_push(&cmd));
+        }
+
+        /// Extra leading/trailing whitespace around a flagged command must
+        /// not change the verdict.
+        #[test]
+        fn whitespace_padding_does_not_change_verdict(pad in " {0,5}") {
+            let cmd = format!("{pad}git commit -m x{pad}");
+            prop_assert!(command_touches_commit_or_push(&cmd));
+        }
+    }
+}
