@@ -2,6 +2,9 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// One of the five opavs workflow phases: Orient, Plan, Act, Verify, Ship.
+/// Each widens the blast radius of what's allowed — see the `opavs` skill
+/// for the full discipline this gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Orient,
@@ -39,10 +42,13 @@ impl fmt::Display for Phase {
 
 /// Port: persist and retrieve the current opavs phase for a repo.
 pub trait PhaseStore {
+    /// Current phase, or `Phase::Orient` if none has been recorded yet.
     fn get(&self) -> Result<Phase>;
+    /// Record the repo's new current phase.
     fn set(&self, phase: Phase) -> Result<()>;
 }
 
+/// Where a task graph entry currently stands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -51,6 +57,7 @@ pub enum TaskStatus {
     Done,
 }
 
+/// A single unit of work in the task graph, keyed by `id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -58,6 +65,7 @@ pub struct Task {
     pub description: String,
     #[serde(default = "default_status")]
     pub status: TaskStatus,
+    /// Ids of tasks that must be `Done` before this one is runnable.
     #[serde(default)]
     pub depends_on: Vec<String>,
 }
@@ -66,6 +74,32 @@ fn default_status() -> TaskStatus {
     TaskStatus::Todo
 }
 
+impl TaskStatus {
+    pub fn parse(s: &str) -> Result<TaskStatus, String> {
+        match s {
+            "todo" => Ok(TaskStatus::Todo),
+            "in_progress" => Ok(TaskStatus::InProgress),
+            "done" => Ok(TaskStatus::Done),
+            other => Err(format!(
+                "invalid status: {other} (expected todo|in_progress|done)"
+            )),
+        }
+    }
+}
+
+/// Pure domain logic: set a task's status by id. Returns an error string if
+/// the id is unknown, so CLI callers can surface it without a panic.
+pub fn set_status(graph: &mut TaskGraph, id: &str, status: TaskStatus) -> Result<(), String> {
+    let task = graph
+        .tasks
+        .iter_mut()
+        .find(|t| t.id == id)
+        .ok_or_else(|| format!("unknown task id: {id}"))?;
+    task.status = status;
+    Ok(())
+}
+
+/// The full set of tasks tracked for a repo.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TaskGraph {
     #[serde(default)]
@@ -74,7 +108,9 @@ pub struct TaskGraph {
 
 /// Port: persist and retrieve the task graph for a repo.
 pub trait TaskStore {
+    /// Current graph, or an empty one if none has been saved yet.
     fn load(&self) -> Result<TaskGraph>;
+    /// Persist the graph, overwriting whatever was saved before.
     fn save(&self, graph: &TaskGraph) -> Result<()>;
 }
 
@@ -245,6 +281,38 @@ mod tests {
             ],
         };
         assert!(matches!(validate(&graph), Err(GraphError::Cycle(_))));
+    }
+
+    #[test]
+    fn task_status_parse_roundtrips_all_variants() {
+        assert_eq!(TaskStatus::parse("todo").unwrap(), TaskStatus::Todo);
+        assert_eq!(
+            TaskStatus::parse("in_progress").unwrap(),
+            TaskStatus::InProgress
+        );
+        assert_eq!(TaskStatus::parse("done").unwrap(), TaskStatus::Done);
+    }
+
+    #[test]
+    fn task_status_parse_rejects_unknown() {
+        assert!(TaskStatus::parse("bogus").is_err());
+    }
+
+    #[test]
+    fn set_status_updates_matching_task() {
+        let mut graph = TaskGraph {
+            tasks: vec![task("a", TaskStatus::Todo, &[])],
+        };
+        set_status(&mut graph, "a", TaskStatus::Done).unwrap();
+        assert_eq!(graph.tasks[0].status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn set_status_errors_on_unknown_id() {
+        let mut graph = TaskGraph {
+            tasks: vec![task("a", TaskStatus::Todo, &[])],
+        };
+        assert!(set_status(&mut graph, "ghost", TaskStatus::Done).is_err());
     }
 
     #[test]
