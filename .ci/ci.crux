@@ -1,0 +1,17 @@
+pipeline: opavs_ci
+budget: { calls: 10, duration_ms: 600000 }
+steps:
+  - step: fmt_check
+    handler: shell::capture
+    args:
+      cmd: "cargo fmt --check"
+
+  - step: clippy
+    handler: shell::capture
+    args:
+      cmd: "cargo clippy --all-targets"
+
+  - step: test
+    handler: shell::capture
+    args:
+      cmd: "cargo nextest run --workspace"
