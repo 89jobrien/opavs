@@ -28,7 +28,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Resolve crux commit
+        id: crux-sha
+        run: echo "sha=$(git ls-remote https://github.com/89jobrien/crux HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache crux binary
+        id: cache-crux
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/crux
+          key: crux-bin-${{ runner.os }}-${{ steps.crux-sha.outputs.sha }}
+
       - name: Install crux
+        if: steps.cache-crux.outputs.cache-hit != 'true'
         run: cargo install --git https://github.com/89jobrien/crux crux-cli --locked
 
       - name: Run CI pipeline
