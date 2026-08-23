@@ -29,7 +29,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install crux
-        run: cargo install --git https://github.com/89jobrien/crux --locked
+        run: cargo install --git https://github.com/89jobrien/crux crux-cli --locked
 
       - name: Run CI pipeline
         run: crux run .ci/ci.crux
