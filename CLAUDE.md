@@ -3,8 +3,10 @@
 `opavs` — Rust CLI implementing the Orient-Plan-Act-Verify-Ship workflow
 phasing system: it gates what's allowed (edits, commits) based on which
 phase a repo is in, enforced via a PreToolUse guard hook rather than
-convention alone. Originally defined as shell scripts in the `opavs` Claude
-Code plugin (`~/.claude/plugins/local-marketplace/plugins/opavs/`).
+convention alone. Originally prototyped as shell scripts in the `opavs` Claude Code plugin
+(`~/.claude/plugins/local-marketplace/plugins/opavs/`); that plugin's
+`hooks/hooks.json` now shells out to this compiled binary (`opavs guard`)
+instead of running its own scripts.
 
 The task graph (`domain::Task`/`TaskGraph`, `src/import.rs`, `opavs tasks
 *`) is a secondary, optional companion for repos that want to track
