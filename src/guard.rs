@@ -16,12 +16,12 @@ pub fn decide(
     repo_root: &str,
 ) -> Verdict {
     match tool {
-        "Edit" | "Write" => {
+        "Edit" | "Write" | "apply_patch" | "BashMutation" => {
             if current_phase == Phase::Act {
                 Verdict::Allow
             } else {
                 Verdict::Deny(format!(
-                    "opavs ({repo_root}): repo is in the {current_phase} phase. Edits are only allowed in ACT -- run `opavs phase set ACT` (in {repo_root}) once the user has actually approved that transition."
+                    "opavs ({repo_root}): repo is in the {current_phase} phase. File mutations are only allowed in ACT -- run `opavs phase set ACT` (in {repo_root}) once the user has actually approved that transition."
                 ))
             }
         }
@@ -35,6 +35,86 @@ pub fn decide(
             }
         }
         _ => Verdict::Allow,
+    }
+}
+
+/// Return whether a shell command is safe to run in a phase that does not
+/// permit arbitrary file mutations. Unknown commands fail closed.
+pub fn shell_command_allowed(cmd: &str, phase: Phase) -> bool {
+    if phase == Phase::Act {
+        return true;
+    }
+
+    cmd.split([';', '&', '|'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .all(|segment| shell_segment_allowed(segment, phase))
+}
+
+fn shell_segment_allowed(segment: &str, phase: Phase) -> bool {
+    if segment.contains(['>', '<', '`']) || segment.contains("$(") {
+        return false;
+    }
+
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let Some(program) = words.first().copied() else {
+        return true;
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+
+    match program {
+        "opavs" => opavs_command_allowed(&words[1..], phase),
+        "git" => git_command_allowed(&words[1..]),
+        "cargo" => cargo_command_allowed(&words[1..], phase),
+        "pwd" | "ls" | "rg" | "fd" | "file" | "which" => true,
+        "nu" => words
+            .get(1)
+            .is_some_and(|path| path.ends_with(".claude/skills/run-opavs/smoke.nu")),
+        "hj" | "godmode" if phase == Phase::Ship => {
+            words.get(1).is_some_and(|command| *command == "handoff")
+        }
+        _ => false,
+    }
+}
+
+fn opavs_command_allowed(args: &[&str], phase: Phase) -> bool {
+    match args {
+        ["phase", "get"] | ["phase", "set", _] => true,
+        ["tasks", "list"] | ["tasks", "runnable"] | ["tasks", "validate"] => true,
+        ["tasks", "set-status", ..] | ["tasks", "import", ..] => phase == Phase::Plan,
+        _ => false,
+    }
+}
+
+fn git_command_allowed(args: &[&str]) -> bool {
+    let args = if matches!(args.first(), Some(&"-C")) && args.len() >= 3 {
+        &args[2..]
+    } else {
+        args
+    };
+
+    matches!(
+        args,
+        ["status", ..]
+            | ["diff", ..]
+            | ["log", ..]
+            | ["show", ..]
+            | ["rev-parse", ..]
+            | ["branch"]
+            | ["branch", "--show-current"]
+            | ["remote", "-v"]
+    )
+}
+
+fn cargo_command_allowed(args: &[&str], phase: Phase) -> bool {
+    if phase != Phase::Verify && phase != Phase::Ship {
+        return matches!(args, ["metadata", ..]);
+    }
+
+    match args {
+        ["check", ..] | ["clippy", ..] | ["test", ..] | ["nextest", "run", ..] => true,
+        ["fmt", rest @ ..] => rest.contains(&"--check"),
+        _ => false,
     }
 }
 
@@ -81,6 +161,40 @@ mod tests {
         assert!(matches!(
             decide("Write", false, Phase::Plan, "/repo"),
             Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn apply_patch_denied_outside_act() {
+        assert!(matches!(
+            decide("apply_patch", false, Phase::Verify, "/repo"),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn mutating_bash_denied_outside_act() {
+        assert!(matches!(
+            decide("BashMutation", false, Phase::Verify, "/repo"),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn shell_policy_allows_verification_commands_but_denies_formatting() {
+        assert!(shell_command_allowed("cargo test", Phase::Verify));
+        assert!(shell_command_allowed(
+            "cargo fmt --all --check",
+            Phase::Verify
+        ));
+        assert!(!shell_command_allowed("cargo fmt --all", Phase::Verify));
+    }
+
+    #[test]
+    fn shell_policy_denies_mutation_hidden_in_a_chain() {
+        assert!(!shell_command_allowed(
+            "git status | tee status.txt",
+            Phase::Orient
         ));
     }
 

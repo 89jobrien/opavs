@@ -1,1 +1,50 @@
-tasks: []
+tasks:
+- id: phase-command-tests
+  description: Add failing phase-command installer tests
+  status: done
+  depends_on: []
+- id: phase-command-implementation
+  description: Implement canonical phase playbooks and installers
+  status: done
+  depends_on:
+  - phase-command-tests
+- id: phase-command-cli
+  description: Cover CLI command installation and idempotence
+  status: done
+  depends_on:
+  - phase-command-implementation
+- id: phase-command-docs
+  description: Document OPAVS phase slash commands
+  status: done
+  depends_on:
+  - phase-command-cli
+- id: init-opavs-md
+  description: Make OPAVS.md canonical and link existing instruction files
+  status: done
+  depends_on:
+  - phase-command-docs
+- id: docs-audit-regressions
+  description: Add regression tests for generated workflow documentation
+  status: done
+  depends_on:
+  - init-opavs-md
+- id: docs-audit-generated-workflows
+  description: Correct generated OPAVS skill and SHIP workflow
+  status: done
+  depends_on:
+  - docs-audit-regressions
+- id: docs-audit-static-docs
+  description: Correct README, CLAUDE, CLI, and smoke-test documentation
+  status: done
+  depends_on:
+  - docs-audit-generated-workflows
+- id: docs-audit-memory
+  description: Record current OPAVS active context and progress
+  status: done
+  depends_on:
+  - docs-audit-static-docs
+- id: docs-audit-verify
+  description: Run documentation and Rust verification gates
+  status: done
+  depends_on:
+  - docs-audit-memory

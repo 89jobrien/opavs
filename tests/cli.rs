@@ -10,6 +10,15 @@ fn opavs() -> Command {
 }
 
 #[test]
+fn help_lists_upgrade_command() {
+    opavs()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("upgrade"));
+}
+
+#[test]
 fn init_then_phase_get_defaults_to_orient() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -19,6 +28,11 @@ fn init_then_phase_get_defaults_to_orient() {
         .assert()
         .success()
         .stdout(predicates::str::contains("created"));
+
+    assert!(tmp.path().join("OPAVS.md").is_file());
+    let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+    assert!(agents.contains("This repo uses the opavs"));
+    assert!(!agents.contains("@OPAVS.md"));
 
     opavs()
         .current_dir(tmp.path())
@@ -138,4 +152,35 @@ fn tasks_validate_reports_cycle() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("cycle"));
+}
+
+#[test]
+fn plugin_install_codex_writes_into_custom_home() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    opavs()
+        .args(["plugin", "install", "codex", "--home"])
+        .arg(tmp.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("codex: updated"));
+
+    assert!(tmp.path().join(".agents/skills/opavs/SKILL.md").exists());
+    assert!(tmp.path().join(".codex/hooks.json").exists());
+
+    for phase in ["orient", "plan", "act", "verify", "ship"] {
+        assert!(
+            tmp.path()
+                .join(".codex/commands")
+                .join(format!("opavs-{phase}.md"))
+                .exists()
+        );
+    }
+
+    opavs()
+        .args(["plugin", "install", "codex", "--home"])
+        .arg(tmp.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("codex: already up to date"));
 }

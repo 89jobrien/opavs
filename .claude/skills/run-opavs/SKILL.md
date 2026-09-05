@@ -7,9 +7,10 @@ Paths below are relative to the opavs repo root (`/Users/joe/dev/opavs`), not to
 this skill directory.
 
 opavs is a CLI, not a GUI/server — there's no window to screenshot. The agent
-path is the driver script, which exercises every subcommand (`init`, `phase
-get/set`, `tasks list/runnable/validate/set-status/import`, `guard`) against a
-disposable scratch repo and prints each command's real output.
+path is the driver script, which exercises the core phase, task, and guard
+commands (`init`, `phase get/set`, `tasks list/runnable/validate/set-status/import`,
+and `guard`) against a disposable scratch repo and prints each command's real
+output. Plugin installation and self-upgrade are covered by Rust tests instead.
 
 ## Build
 
@@ -71,15 +72,16 @@ cargo test
   `invalid phase: plan (expected ORIENT|PLAN|ACT|VERIFY|SHIP)` — it does not
   lowercase or fuzzy-match. Always pass `ORIENT`/`PLAN`/`ACT`/`VERIFY`/`SHIP`.
 - **`opavs tasks *` and `opavs phase *` resolve the repo root by walking up
-  from the current directory** looking for `.ctx/opavs/tasks.yaml` — they
-  ignore `$PWD`-independent flags entirely. Running them outside an
-  `opavs init`-ed tree (or a subdirectory of one) fails with `no
+  from the current directory** looking for `.ctx/opavs/tasks.yaml`, stopping
+  at the nearest Git repository or worktree boundary. They ignore
+  `$PWD`-independent flags entirely. Running them outside an `opavs init`-ed
+  tree (or a subdirectory of one) fails with `no
 .ctx/opavs/tasks.yaml found ... run 'opavs init' first`. `cd` into the
   scratch repo before calling anything but `init`/`guard`.
 - **`opavs guard` needs `cwd` in the hook JSON** (or falls back to the
   `$PWD` env var) to resolve which repo's phase gates the decision — a
   hand-built hook payload missing `cwd` while your shell's cwd isn't the
   target repo silently resolves to the wrong (or no) repo and always allows.
-- **A repo with no `.ctx/opavs/tasks.yaml` guards nothing.** `evaluate_guard`
+- **A repo or worktree with no `.ctx/opavs/tasks.yaml` guards nothing.** `evaluate_guard`
   treats "no repo root found" as an unconditional allow, not a deny — so
   running `guard` against a plain, non-opavs repo is a silent no-op.

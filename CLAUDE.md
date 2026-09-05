@@ -23,11 +23,16 @@ Hexagonal (see `~/.claude/skills/writing-solid-rust`):
 - `src/adapters.rs` — `FsPhaseStore`/`FsTaskStore`: filesystem implementations
   of the ports.
 - `src/guard.rs` — pure `decide()` allow/deny logic for the PreToolUse hook.
-- `src/repo.rs` — repo-root resolution (walk up for `.ctx/opavs/tasks.yaml`).
-- `src/init.rs` — scaffolds `.ctx/opavs/tasks.yaml`, `.ctx/opavs/memory-bank/`,
-  `AGENTS.md` in a target repo.
+- `src/repo.rs` — repo-root resolution (walk up for `.ctx/opavs/tasks.yaml`,
+  stopping at the nearest Git repository or worktree boundary).
+- `src/init.rs` — scaffolds OPAVS state and `OPAVS.md`, then updates existing
+  `AGENTS.md`/`CLAUDE.md` instruction files or creates `AGENTS.md` when absent.
 - `src/import.rs` — reads an external `GODMODE.tasks.yaml` (same schema) and
   merges it into the repo's graph by id, preserving existing task status.
+- `src/plugin.rs` — installs client hooks, skills, phase commands, and OpenCode
+  integration files under an explicit home directory.
+- `src/upgrade.rs` — resolves the current platform release and replaces the
+  installed executable after downloading and unpacking it.
 - `src/main.rs` — composition root: clap CLI wiring subcommands to adapters.
 - `src/lib.rs` — re-exports the above modules so `tests/` and `fuzz/` can
   link against the crate as a library; `main.rs` is a thin binary over it.
@@ -40,7 +45,7 @@ cargo clippy --all-targets
 cargo test
 ```
 
-Per `~/.claude/skills/testing-philosophy`, all seven dimensions are in use:
+Six testing dimensions are currently in use:
 
 - Unit: pure domain/guard logic tested inline in `#[cfg(test)]` modules.
 - Property (`proptest`, dev-dep): `guard::command_touches_commit_or_push`

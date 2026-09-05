@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use opavs::adapters::{FsPhaseStore, FsTaskStore};
 use opavs::domain::{self, Phase, PhaseStore, TaskStatus, TaskStore};
-use opavs::{guard, import, init, repo};
+use opavs::{guard, import, init, plugin, repo, upgrade};
 use std::env;
 use std::io::Read;
 use std::path::PathBuf;
@@ -20,8 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scaffold .ctx/opavs/tasks.yaml, .ctx/opavs/memory-bank/, and AGENTS.md
-    /// in a repo.
+    /// Scaffold OPAVS state, OPAVS.md, and instruction-file links in a repo.
     Init {
         #[arg(default_value = ".")]
         repo_root: PathBuf,
@@ -39,6 +38,13 @@ enum Command {
     /// PreToolUse hook entrypoint: reads Claude Code hook JSON on stdin,
     /// emits a permissionDecision JSON verdict on stdout.
     Guard,
+    /// Install OPAVS integrations for agent clients.
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
+    /// Download and install the newest release from GitHub.
+    Upgrade,
 }
 
 #[derive(Subcommand)]
@@ -61,6 +67,27 @@ enum TasksAction {
     /// path/state convention) into this repo's graph (upsert by id; existing
     /// task status is preserved).
     Import { path: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum PluginAction {
+    /// Install plugin integration for one target (or all).
+    Install {
+        #[arg(value_enum)]
+        target: PluginTarget,
+        /// Override the home directory used for installation.
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum PluginTarget {
+    Claude,
+    Codex,
+    Gemini,
+    Opencode,
+    All,
 }
 
 fn find_repo_root(explicit: Option<&PathBuf>) -> Result<PathBuf> {
@@ -148,6 +175,54 @@ fn main() -> Result<()> {
             }
         }
         Command::Guard => run_guard()?,
+        Command::Plugin { action } => match action {
+            PluginAction::Install { target, home } => {
+                let home = home
+                    .or_else(|| env::var("HOME").ok().map(PathBuf::from))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unable to resolve home directory; pass --home explicitly")
+                    })?;
+
+                let targets: Vec<plugin::Target> = match target {
+                    PluginTarget::Claude => vec![plugin::Target::Claude],
+                    PluginTarget::Codex => vec![plugin::Target::Codex],
+                    PluginTarget::Gemini => vec![plugin::Target::Gemini],
+                    PluginTarget::Opencode => vec![plugin::Target::Opencode],
+                    PluginTarget::All => vec![
+                        plugin::Target::Claude,
+                        plugin::Target::Codex,
+                        plugin::Target::Gemini,
+                        plugin::Target::Opencode,
+                    ],
+                };
+
+                for t in targets {
+                    let changed = plugin::install(t, &home)?;
+                    let label = match t {
+                        plugin::Target::Claude => "claude",
+                        plugin::Target::Codex => "codex",
+                        plugin::Target::Gemini => "gemini",
+                        plugin::Target::Opencode => "opencode",
+                    };
+                    if changed.is_empty() {
+                        println!("{label}: already up to date");
+                    } else {
+                        println!("{label}: updated {} file(s)", changed.len());
+                        for path in changed {
+                            println!("  {path}");
+                        }
+                    }
+                }
+            }
+        },
+        Command::Upgrade => match upgrade::run()? {
+            upgrade::UpgradeOutcome::Updated { version } => {
+                println!("upgraded opavs to {version}")
+            }
+            upgrade::UpgradeOutcome::UpToDate { version } => {
+                println!("opavs {version} is already up to date")
+            }
+        },
     }
 
     Ok(())
@@ -163,6 +238,7 @@ enum GuardRequest {
         tool: String,
         target_dir: String,
         is_commit_or_push: bool,
+        command: Option<String>,
     },
 }
 
@@ -171,9 +247,10 @@ fn parse_guard_request(hook: &serde_json::Value, session_cwd: &str) -> GuardRequ
     let tool = hook.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
 
     match tool {
-        "Edit" | "Write" => {
+        "Edit" | "Write" | "edit" | "write" => {
             let file_path = hook
                 .pointer("/tool_input/file_path")
+                .or_else(|| hook.pointer("/tool_input/filePath"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if file_path.is_empty() {
@@ -184,24 +261,33 @@ fn parse_guard_request(hook: &serde_json::Value, session_cwd: &str) -> GuardRequ
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
             GuardRequest::Check {
-                tool: tool.to_string(),
+                tool: if tool.eq_ignore_ascii_case("edit") {
+                    "Edit".to_string()
+                } else {
+                    "Write".to_string()
+                },
                 target_dir,
                 is_commit_or_push: false,
+                command: None,
             }
         }
-        "Bash" => {
+        "apply_patch" | "ApplyPatch" => GuardRequest::Check {
+            tool: "apply_patch".to_string(),
+            target_dir: session_cwd.to_string(),
+            is_commit_or_push: false,
+            command: None,
+        },
+        "Bash" | "bash" => {
             let cmd = hook
                 .pointer("/tool_input/command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !guard::command_touches_commit_or_push(cmd) {
-                return GuardRequest::Allow;
-            }
             let target_dir = extract_dash_c_target(cmd).unwrap_or_else(|| session_cwd.to_string());
             GuardRequest::Check {
-                tool: tool.to_string(),
+                tool: "Bash".to_string(),
                 target_dir,
-                is_commit_or_push: true,
+                is_commit_or_push: guard::command_touches_commit_or_push(cmd),
+                command: Some(cmd.to_string()),
             }
         }
         _ => GuardRequest::Allow,
@@ -225,6 +311,7 @@ fn evaluate_guard(
         tool,
         target_dir,
         is_commit_or_push,
+        command,
     } = request
     else {
         return ALLOW_JSON.to_string();
@@ -234,8 +321,19 @@ fn evaluate_guard(
         return ALLOW_JSON.to_string();
     };
 
+    let effective_tool = if tool == "Bash"
+        && !is_commit_or_push
+        && command
+            .as_deref()
+            .is_some_and(|cmd| !guard::shell_command_allowed(cmd, phase))
+    {
+        "BashMutation"
+    } else {
+        &tool
+    };
+
     match guard::decide(
-        &tool,
+        effective_tool,
         is_commit_or_push,
         phase,
         &repo_root.display().to_string(),
@@ -304,6 +402,10 @@ mod tests {
         serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}})
     }
 
+    fn patch_hook() -> serde_json::Value {
+        serde_json::json!({"tool_name": "apply_patch", "tool_input": {"patchText": "patch"}})
+    }
+
     #[test]
     fn parse_guard_request_edit_with_empty_path_allows() {
         assert_eq!(
@@ -321,15 +423,21 @@ mod tests {
                 tool: "Edit".to_string(),
                 target_dir: "/repo/src".to_string(),
                 is_commit_or_push: false,
+                command: None,
             }
         );
     }
 
     #[test]
-    fn parse_guard_request_bash_non_commit_allows() {
+    fn parse_guard_request_bash_non_commit_yields_check() {
         assert_eq!(
             parse_guard_request(&bash_hook("cargo test"), "/cwd"),
-            GuardRequest::Allow
+            GuardRequest::Check {
+                tool: "Bash".to_string(),
+                target_dir: "/cwd".to_string(),
+                is_commit_or_push: false,
+                command: Some("cargo test".to_string()),
+            }
         );
     }
 
@@ -342,6 +450,7 @@ mod tests {
                 tool: "Bash".to_string(),
                 target_dir: "/repo".to_string(),
                 is_commit_or_push: true,
+                command: Some("git -C /repo commit -m x".to_string()),
             }
         );
     }
@@ -355,6 +464,7 @@ mod tests {
                 tool: "Bash".to_string(),
                 target_dir: "/session/cwd".to_string(),
                 is_commit_or_push: true,
+                command: Some("git commit -m x".to_string()),
             }
         );
     }
@@ -373,7 +483,8 @@ mod tests {
 
     #[test]
     fn evaluate_guard_allows_when_request_is_allow() {
-        let out = evaluate_guard(&bash_hook("cargo test"), "/cwd", |_| unreachable!());
+        let hook = serde_json::json!({"tool_name": "Read"});
+        let out = evaluate_guard(&hook, "/cwd", |_| unreachable!());
         assert_eq!(out, ALLOW_JSON);
     }
 
@@ -398,6 +509,32 @@ mod tests {
         });
         assert!(out.contains("\"permissionDecision\":\"deny\""));
         assert!(out.contains("ACT"));
+    }
+
+    #[test]
+    fn evaluate_guard_denies_apply_patch_outside_act_phase() {
+        let out = evaluate_guard(&patch_hook(), "/repo", |_| {
+            Some((PathBuf::from("/repo"), Phase::Verify))
+        });
+        assert!(out.contains("\"permissionDecision\":\"deny\""));
+        assert!(out.contains("ACT"));
+    }
+
+    #[test]
+    fn evaluate_guard_denies_mutating_bash_outside_act_phase() {
+        let out = evaluate_guard(&bash_hook("cargo fmt --all"), "/repo", |_| {
+            Some((PathBuf::from("/repo"), Phase::Verify))
+        });
+        assert!(out.contains("\"permissionDecision\":\"deny\""));
+        assert!(out.contains("ACT"));
+    }
+
+    #[test]
+    fn evaluate_guard_allows_verification_bash_in_verify_phase() {
+        let out = evaluate_guard(&bash_hook("cargo test"), "/repo", |_| {
+            Some((PathBuf::from("/repo"), Phase::Verify))
+        });
+        assert_eq!(out, ALLOW_JSON);
     }
 
     #[test]
