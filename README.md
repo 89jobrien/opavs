@@ -43,6 +43,9 @@ opavs plugin install <target> [--home /path/to/home]
                             # install OPAVS integration for one target:
                             # claude | codex | gemini | opencode | all
 
+opavs doctor [repo_root] [--home /path/to/home]
+                            # diagnose repository and client integration state
+
 opavs upgrade               # download and install the newest GitHub release
 ```
 

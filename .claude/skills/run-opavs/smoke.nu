@@ -5,6 +5,7 @@
 #
 # Usage: nu .claude/skills/run-opavs/smoke.nu [path/to/opavs/binary]
 # Defaults to target/debug/opavs relative to the repo root (built if missing).
+# TODO(ci-smoke-fuzz): Run this smoke flow and the existing fuzz target in CI.
 
 def main [bin_path?: string] {
     let repo_root = ($env.PWD)

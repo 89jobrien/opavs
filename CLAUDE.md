@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+@OPAVS.md
+
 `opavs` — Rust CLI implementing the Orient-Plan-Act-Verify-Ship workflow
 phasing system: it gates what's allowed (edits, commits) based on which
 phase a repo is in, enforced via a PreToolUse guard hook rather than

@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod doctor;
 pub mod domain;
 pub mod guard;
 pub mod import;

@@ -9,18 +9,19 @@ const ACTIVE_CONTEXT_TEMPLATE: &str = "# Active Context\n\n\
 const PROGRESS_TEMPLATE: &str = "# Progress\n\n\
     _Milestones as they land. Append, don't rewrite history._\n";
 
-const OPAVS_TEMPLATE: &str = "# OPAVS\n\n\
+pub(crate) const OPAVS_TEMPLATE: &str = "# OPAVS\n\n\
     This repo uses the opavs (Orient-Plan-Act-Verify-Ship) phase discipline.\n\n\
     - Task graph: `.ctx/opavs/tasks.yaml` (managed via `opavs tasks`)\n\
     - Memory bank: `.ctx/opavs/memory-bank/` (`active-context.md`, `progress.md`)\n\
     - Current phase: `.ctx/opavs/phase` (managed via `opavs phase`, not committed)\n";
 
-const OPAVS_LINK: &str = "@OPAVS.md";
+pub(crate) const OPAVS_LINK: &str = "@OPAVS.md";
 
 /// Scaffold the files opavs requires in a target repo: task graph, memory
 /// bank, canonical instructions, and instruction-file links. Refuses to
 /// overwrite generated state or an existing OPAVS.md.
 pub fn scaffold(repo_root: &Path) -> Result<Vec<String>> {
+    // TODO(init-repair): Add a repair/refresh mode for partial or stale scaffolds.
     let mut created = Vec::new();
 
     let opavs_dir = repo_root.join(".ctx").join("opavs");

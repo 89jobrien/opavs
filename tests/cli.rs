@@ -3,10 +3,18 @@
 //! invoke it. Unit tests cover the pure logic; these cover the wiring.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use std::fs;
+use std::path::Path;
 
 fn opavs() -> Command {
     Command::cargo_bin("opavs").expect("binary builds")
+}
+
+fn doctor(repo: &Path, home: &Path) -> Command {
+    let mut command = opavs();
+    command.arg("doctor").arg(repo).arg("--home").arg(home);
+    command
 }
 
 #[test]
@@ -16,6 +24,184 @@ fn help_lists_upgrade_command() {
         .assert()
         .success()
         .stdout(predicates::str::contains("upgrade"));
+}
+
+#[test]
+fn doctor_missing_state_recommends_init() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    doctor(tmp.path(), tmp.path())
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("repair: opavs init '"));
+}
+
+#[test]
+fn doctor_partial_state_does_not_recommend_failing_init() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("OPAVS.md"), "# OPAVS\n").expect("write partial state");
+
+    doctor(tmp.path(), tmp.path())
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("repair missing task graph"))
+        .stdout(predicates::str::contains("opavs init").not());
+}
+
+#[test]
+fn doctor_allows_init_when_only_agent_instructions_exist() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("AGENTS.md"), "# Existing instructions\n")
+        .expect("write instructions");
+
+    doctor(tmp.path(), tmp.path())
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("repair: opavs init '"));
+}
+
+#[test]
+fn doctor_partial_state_reports_missing_instructions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let tasks = tmp.path().join(".ctx/opavs/tasks.yaml");
+    fs::create_dir_all(tasks.parent().expect("tasks parent")).expect("create state dir");
+    fs::write(tasks, "tasks: []\n").expect("write tasks");
+
+    doctor(tmp.path(), tmp.path())
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("repo.instructions.missing"));
+}
+
+#[test]
+fn doctor_reports_initialized_repository_as_healthy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+
+    doctor(tmp.path(), tmp.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("repo.tasks.valid"))
+        .stdout(predicates::str::contains("repo.instructions.linked"));
+}
+
+#[test]
+fn doctor_accepts_rooted_phase_gitignore_pattern() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    fs::write(tmp.path().join(".gitignore"), "/.ctx/opavs/phase\n").expect("write gitignore");
+
+    doctor(tmp.path(), tmp.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("repo.phase.ignored"));
+}
+
+#[test]
+fn doctor_reports_partial_plugin_install_as_drift() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    opavs()
+        .args(["plugin", "install", "codex", "--home"])
+        .arg(home.path())
+        .assert()
+        .success();
+    fs::remove_file(home.path().join(".codex/hooks.json")).expect("remove Codex hook");
+
+    doctor(repo.path(), home.path())
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("plugin.codex.drift"))
+        .stdout(predicates::str::contains("opavs plugin install codex"));
+}
+
+#[test]
+fn doctor_reports_all_installed_plugins_as_current() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    opavs()
+        .args(["plugin", "install", "all", "--home"])
+        .arg(home.path())
+        .assert()
+        .success();
+
+    let mut assertion = doctor(repo.path(), home.path()).assert().success();
+    for target in ["claude", "codex", "gemini", "opencode"] {
+        assertion = assertion.stdout(predicates::str::contains(format!(
+            "plugin.{target}.current"
+        )));
+    }
+}
+
+#[test]
+fn doctor_ignores_unrelated_shared_client_config() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    fs::create_dir_all(home.path().join(".codex")).expect("create Codex config dir");
+    fs::write(home.path().join(".codex/hooks.json"), "{\"hooks\":{}}\n")
+        .expect("write unrelated Codex hooks");
+    fs::create_dir_all(home.path().join(".config/opencode")).expect("create OpenCode config dir");
+    fs::write(
+        home.path().join(".config/opencode/opencode.json"),
+        "{\"plugin\":[]}\n",
+    )
+    .expect("write unrelated OpenCode config");
+
+    doctor(repo.path(), home.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("plugin.codex.missing"))
+        .stdout(predicates::str::contains("plugin.opencode.missing"));
+}
+
+#[test]
+fn doctor_treats_malformed_opavs_shared_config_as_drift() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    fs::create_dir_all(home.path().join(".codex")).expect("create Codex config dir");
+    fs::write(home.path().join(".codex/hooks.json"), "opavs guard\n")
+        .expect("write malformed OPAVS hook config");
+
+    doctor(repo.path(), home.path())
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("plugin.codex.drift"));
+}
+
+#[test]
+fn doctor_rejects_stale_owned_and_malformed_shared_artifacts() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    opavs()
+        .args(["plugin", "install", "claude", "--home"])
+        .arg(home.path())
+        .assert()
+        .success();
+    opavs()
+        .args(["plugin", "install", "codex", "--home"])
+        .arg(home.path())
+        .assert()
+        .success();
+
+    let claude_skill = home
+        .path()
+        .join(".claude/plugins/local-marketplace/plugins/opavs/skills/opavs/SKILL.md");
+    let mut stale_skill = fs::read_to_string(&claude_skill).expect("read Claude skill");
+    stale_skill.push_str("# stale\n");
+    fs::write(claude_skill, stale_skill).expect("write stale Claude skill");
+    fs::write(home.path().join(".codex/hooks.json"), "not json\n")
+        .expect("write malformed Codex hooks");
+
+    doctor(repo.path(), home.path())
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("plugin.claude.drift"))
+        .stdout(predicates::str::contains("plugin.codex.drift"));
 }
 
 #[test]

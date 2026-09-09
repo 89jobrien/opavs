@@ -45,6 +45,7 @@ pub fn shell_command_allowed(cmd: &str, phase: Phase) -> bool {
         return true;
     }
 
+    // TODO(shell-parser): Replace delimiter splitting with quote-aware shell analysis.
     cmd.split([';', '&', '|'])
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
@@ -107,6 +108,7 @@ fn git_command_allowed(args: &[&str]) -> bool {
 }
 
 fn cargo_command_allowed(args: &[&str], phase: Phase) -> bool {
+    // TODO(verification-policy): Load validated per-repository gates for non-Rust projects.
     if phase != Phase::Verify && phase != Phase::Ship {
         return matches!(args, ["metadata", ..]);
     }

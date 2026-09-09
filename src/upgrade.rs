@@ -21,6 +21,7 @@ struct GitHubReleaseUpdater;
 
 impl ReleaseUpdater for GitHubReleaseUpdater {
     fn update(&self) -> Result<self_update::Status> {
+        // TODO(release-checksums): Publish and verify checksums for downloaded release archives.
         self_update::backends::github::Update::configure()
             .repo_owner(REPO_OWNER)
             .repo_name(REPO_NAME)

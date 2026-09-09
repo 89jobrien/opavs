@@ -116,6 +116,7 @@ pub trait TaskStore {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum GraphError {
+    // TODO(task-id-validation): Reject duplicate task IDs before set/map construction obscures them.
     UnknownDependency { task: String, depends_on: String },
     Cycle(Vec<String>),
 }

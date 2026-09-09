@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use opavs::adapters::{FsPhaseStore, FsTaskStore};
+use opavs::adapters::{FsArtifactReader, FsPhaseStore, FsTaskStore};
 use opavs::domain::{self, Phase, PhaseStore, TaskStatus, TaskStore};
-use opavs::{guard, import, init, plugin, repo, upgrade};
+use opavs::{doctor, guard, import, init, plugin, repo, upgrade};
 use std::env;
 use std::io::Read;
 use std::path::PathBuf;
@@ -14,6 +14,7 @@ use std::path::PathBuf;
     about = "Orient-Plan-Act-Verify-Ship phase discipline CLI"
 )]
 struct Cli {
+    // TODO(machine-output): Add a stable text/JSON output format for automation clients.
     #[command(subcommand)]
     command: Command,
 }
@@ -37,6 +38,7 @@ enum Command {
     },
     /// PreToolUse hook entrypoint: reads Claude Code hook JSON on stdin,
     /// emits a permissionDecision JSON verdict on stdout.
+    // TODO(guard-explain): Add a direct command that explains guard policy decisions.
     Guard,
     /// Install OPAVS integrations for agent clients.
     Plugin {
@@ -45,6 +47,14 @@ enum Command {
     },
     /// Download and install the newest release from GitHub.
     Upgrade,
+    /// Diagnose repository and client integration state without applying repairs.
+    Doctor {
+        #[arg(default_value = ".")]
+        repo_root: PathBuf,
+        /// Override the home directory inspected for client integrations.
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -119,6 +129,7 @@ fn main() -> Result<()> {
             match action {
                 PhaseAction::Get => println!("{}", store.get()?),
                 PhaseAction::Set { phase } => {
+                    // TODO(phase-transitions): Optionally enforce approved phase edges and verification receipts.
                     let phase = Phase::parse(&phase)?;
                     store.set(phase)?;
                     println!("opavs phase -> {phase}");
@@ -223,9 +234,51 @@ fn main() -> Result<()> {
                 println!("opavs {version} is already up to date")
             }
         },
+        Command::Doctor { repo_root, home } => {
+            let home = home
+                .or_else(|| env::var("HOME").ok().map(PathBuf::from))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("unable to resolve home directory; pass --home explicitly")
+                })?;
+            let report = doctor::inspect(&FsArtifactReader, &repo_root, &home)?;
+            render_doctor_report(&report);
+            if report.has_errors() {
+                bail!("doctor found errors");
+            }
+        }
     }
 
     Ok(())
+}
+
+fn render_doctor_report(report: &doctor::DoctorReport) {
+    for finding in &report.findings {
+        println!("{:?}\t{}\t{}", finding.level, finding.code, finding.message);
+        if let Some(repair) = &finding.repair {
+            match repair {
+                doctor::RepairAction::RunInit { repo_root } => {
+                    println!(
+                        "  repair: opavs init {}",
+                        shell_quote(&repo_root.display().to_string())
+                    );
+                }
+                doctor::RepairAction::InstallPlugin { target, home } => {
+                    println!(
+                        "  repair: opavs plugin install {} --home {}",
+                        target.as_str(),
+                        shell_quote(&home.display().to_string())
+                    );
+                }
+                doctor::RepairAction::Manual { description } => {
+                    println!("  repair: {description}");
+                }
+            }
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// What a PreToolUse hook call resolves to before any repo/phase lookup:
@@ -387,6 +440,11 @@ mod tests {
             extract_dash_c_target("git -C /repo push origin main"),
             Some("/repo".to_string())
         );
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_apostrophes() {
+        assert_eq!(shell_quote("a b'c"), "'a b'\"'\"'c'");
     }
 
     #[test]

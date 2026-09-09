@@ -1,6 +1,38 @@
+use crate::doctor::ArtifactReader;
 use crate::domain::{Phase, PhaseStore, TaskGraph, TaskStore};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Filesystem-backed reader for read-only doctor checks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FsArtifactReader;
+
+impl ArtifactReader for FsArtifactReader {
+    fn read(&self, path: &Path) -> Result<Option<String>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(std::fs::read_to_string(path)?))
+    }
+
+    fn is_ignored(&self, repo_root: &Path, relative_path: &Path) -> Result<Option<bool>> {
+        if !repo_root.join(".git").exists() {
+            return Ok(None);
+        }
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["check-ignore", "--quiet", "--no-index"])
+            .arg(relative_path)
+            .status()?;
+        Ok(match status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        })
+    }
+}
 
 pub struct FsPhaseStore {
     repo_root: PathBuf,
@@ -60,6 +92,7 @@ impl TaskStore for FsTaskStore {
     }
 
     fn save(&self, graph: &TaskGraph) -> Result<()> {
+        // TODO(atomic-state): Replace direct state overwrites with atomic write-and-rename.
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
