@@ -20,8 +20,40 @@ Build the approved full repair planner across repository state and all supported
 ```rust
 pub trait ArtifactReader {
     fn read(&self, path: &Path) -> Result<Option<String>>;
+
+    fn is_ignored(
+        &self,
+        repo_root: &Path,
+        relative_path: &Path,
+    ) -> Result<Option<bool>> {
+        Ok(None)
+    }
 }
 ```
+
+`read` returns `Ok(None)` only when an artifact does not exist, returns UTF-8 text
+for an existing artifact, and propagates read or decoding failures. The ignore-query
+capability returns `Some(true)` for ignored paths, `Some(false)` for paths Git confirms
+are not ignored, and `None` when no Git decision is available. Its default makes the
+capability optional for readers that cannot query Git; doctor then falls back to reading
+`.gitignore`. Process-launch failures propagate as inspection failures.
+
+The reviewed implementation temporarily combines these capabilities on
+`ArtifactReader`. If the architecture work splits the focused ports, the equivalent
+ignore contract is:
+
+```rust
+pub trait IgnoreQuery {
+    fn is_ignored(
+        &self,
+        repo_root: &Path,
+        relative_path: &Path,
+    ) -> Result<Option<bool>>;
+}
+```
+
+Splitting the ports does not change either contract: `inspect` receives both capabilities,
+while filesystem reads and Git ignore queries remain independently replaceable.
 
 ### Types
 
@@ -73,14 +105,14 @@ impl DoctorReport {
 ## Data Flow
 
 1. Source: the CLI resolves the requested repository path and home directory without requiring an existing OPAVS marker.
-2. Transform: `FsArtifactReader` supplies optional artifact contents to `doctor::inspect`, which evaluates repository state and all supported client integrations.
-3. Sink: the CLI renders findings and advisory repair actions, then exits nonzero only when the report contains errors.
+2. Transform: `FsArtifactReader` supplies optional artifact contents and Git ignore decisions to `doctor::inspect`, which evaluates repository state and all supported client integrations.
+3. Sink: the CLI renders findings and advisory repair actions. A rendered `Error` finding produces a nonzero exit after the report is shown. Setup failures, including unresolved home-directory configuration, and inspection failures from artifact reads or Git process execution also exit nonzero through the CLI error path and may occur before a report is available. Malformed inspected content is normally represented by an `Error` finding in the report.
 
 ## Hexagonal Boundaries
 
-- **Port**: `ArtifactReader` in `opavs::doctor` abstracts read-only artifact access.
-- **Adapter**: `FsArtifactReader` in `opavs::adapters` reads filesystem artifacts.
-- **Domain service**: `doctor::inspect` classifies snapshots without mutating files or launching commands.
+- **Ports**: the reader and ignore-query contracts in `opavs::doctor` abstract text reads and Git ignore decisions. They are currently methods on `ArtifactReader`; a focused split names the second port `IgnoreQuery` without changing its behavior.
+- **Adapter**: `FsArtifactReader` in `opavs::adapters` reads filesystem artifacts and may launch `git check-ignore --quiet --no-index` as a read-only inspection. Exit codes zero and one become ignored/not-ignored decisions; unavailable repository context or an indeterminate Git result yields no decision, while launch failures propagate.
+- **Domain service**: `doctor::inspect` is mutation-free and command-agnostic through its injected ports. It requests observations but neither knows nor controls whether an adapter satisfies them with direct I/O or a read-only subprocess.
 
 ## Integration Points
 
