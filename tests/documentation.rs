@@ -30,9 +30,12 @@ fn design_documents_reader_ignore_failure_and_effect_contracts() {
             "ArtifactReader",
             "fn read(&self",
             "Result<Option<String>>",
-            "IgnoreQuery",
+            "pub trait IgnoreQuery",
             "fn is_ignored(",
             "Result<Option<bool>>",
+            "reader: &dyn ArtifactReader",
+            "ignore: &dyn IgnoreQuery",
+            "catalog: &dyn IntegrationCatalog",
             "Ok(None)",
             "Some(true)",
             "Some(false)",
@@ -42,8 +45,20 @@ fn design_documents_reader_ignore_failure_and_effect_contracts() {
             "inspection",
             "nonzero",
             "git check-ignore",
+            "GitIgnoreQuery",
             "read-only",
         ],
+    );
+
+    assert!(
+        !design.contains("They are currently methods on `ArtifactReader`"),
+        "design must describe the implemented split ports"
+    );
+    assert!(
+        !design.contains(
+            "`FsArtifactReader` in `opavs::adapters` reads filesystem artifacts and may launch"
+        ),
+        "design must attribute Git subprocesses to GitIgnoreQuery"
     );
 }
 
