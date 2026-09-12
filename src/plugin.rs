@@ -1,71 +1,19 @@
 use crate::domain::Phase;
+pub use crate::integration::Target;
+use crate::integration::{
+    ArtifactExpectation, ArtifactMatch, IntegrationCatalog, is_opavs_guard_command,
+};
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Target {
-    Claude,
-    Codex,
-    Gemini,
-    Opencode,
-}
+/// Installer-backed implementation of the neutral integration catalog port.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PluginCatalog;
 
-impl Target {
-    pub(crate) const ALL: [Target; 4] = [
-        Target::Claude,
-        Target::Codex,
-        Target::Gemini,
-        Target::Opencode,
-    ];
-
-    /// Return the stable lowercase CLI name for this integration target.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Target::Claude => "claude",
-            Target::Codex => "codex",
-            Target::Gemini => "gemini",
-            Target::Opencode => "opencode",
-        }
-    }
-}
-
-pub(crate) struct ArtifactExpectation {
-    pub path: PathBuf,
-    pub owned: bool,
-    expected: ArtifactMatch,
-}
-
-enum ArtifactMatch {
-    Exact(String),
-    CodexHook,
-    GeminiEnablement { home_glob: String },
-    OpencodePlugin { plugin_ref: String },
-}
-
-impl ArtifactExpectation {
-    pub fn is_current(&self, contents: &str) -> bool {
-        match &self.expected {
-            ArtifactMatch::Exact(expected) => contents == expected,
-            ArtifactMatch::CodexHook => {
-                serde_json::from_str(contents).is_ok_and(|root| has_codex_pretool_hook(&root))
-            }
-            ArtifactMatch::GeminiEnablement { home_glob } => serde_json::from_str(contents)
-                .is_ok_and(|root| has_gemini_enablement(&root, home_glob)),
-            ArtifactMatch::OpencodePlugin { plugin_ref } => serde_json::from_str(contents)
-                .is_ok_and(|root| has_opencode_plugin_entry(&root, plugin_ref)),
-        }
-    }
-
-    pub fn indicates_install(&self, contents: &str) -> bool {
-        self.owned
-            || self.is_current(contents)
-            || match &self.expected {
-                ArtifactMatch::CodexHook => contents.contains("opavs guard"),
-                ArtifactMatch::GeminiEnablement { .. } => contents.contains("\"opavs\""),
-                ArtifactMatch::OpencodePlugin { .. } => contents.contains("opavs@file://"),
-                ArtifactMatch::Exact(_) => false,
-            }
+impl IntegrationCatalog for PluginCatalog {
+    fn artifacts(&self, target: Target, home: &Path) -> Vec<ArtifactExpectation> {
+        artifact_expectations(target, home)
     }
 }
 
@@ -155,11 +103,9 @@ pub(crate) fn artifact_expectations(target: Target, home: &Path) -> Vec<Artifact
         }
         Target::Codex => {
             artifacts.push(owned(home.join(".agents/skills/opavs/SKILL.md"), SKILL_MD));
-            artifacts.push(ArtifactExpectation {
-                path: home.join(".codex/hooks.json"),
-                owned: false,
-                expected: ArtifactMatch::CodexHook,
-            });
+            artifacts.push(ArtifactExpectation::codex_hook(
+                home.join(".codex/hooks.json"),
+            ));
             add_command_expectations(&mut artifacts, home.join(".codex/commands"), target);
         }
         Target::Gemini => {
@@ -170,13 +116,10 @@ pub(crate) fn artifact_expectations(target: Target, home: &Path) -> Vec<Artifact
                 &render_json(&gemini_descriptor()),
             ));
             artifacts.push(owned(root.join("GEMINI.md"), GEMINI_MD));
-            artifacts.push(ArtifactExpectation {
-                path: home.join(".gemini/extensions/extension-enablement.json"),
-                owned: false,
-                expected: ArtifactMatch::GeminiEnablement {
-                    home_glob: format!("{}/*", home.display()),
-                },
-            });
+            artifacts.push(ArtifactExpectation::gemini_enablement(
+                home.join(".gemini/extensions/extension-enablement.json"),
+                format!("{}/*", home.display()),
+            ));
         }
         Target::Opencode => {
             let root = home.join(".config/opencode/plugins/opavs");
@@ -186,18 +129,10 @@ pub(crate) fn artifact_expectations(target: Target, home: &Path) -> Vec<Artifact
             ));
             artifacts.push(owned(root.join("index.js"), OPENCODE_PLUGIN_JS));
             artifacts.push(owned(root.join("skills/opavs/SKILL.md"), SKILL_MD));
-            artifacts.push(ArtifactExpectation {
-                path: home.join(".config/opencode/opencode.json"),
-                owned: false,
-                expected: ArtifactMatch::OpencodePlugin {
-                    plugin_ref: format!("opavs@file://{}", root.display()),
-                },
-            });
-            add_command_expectations(
-                &mut artifacts,
-                home.join(".config/opencode/commands"),
-                target,
-            );
+            artifacts.push(ArtifactExpectation::opencode_plugin(
+                home.join(".config/opencode/opencode.json"),
+                format!("opavs@file://{}", root.display()),
+            ));
             for command in &PHASE_COMMANDS {
                 artifacts.push(owned(
                     home.join(".config/opencode/agents")
@@ -205,6 +140,11 @@ pub(crate) fn artifact_expectations(target: Target, home: &Path) -> Vec<Artifact
                     &render_opencode_agent(command),
                 ));
             }
+            add_command_expectations(
+                &mut artifacts,
+                home.join(".config/opencode/commands"),
+                target,
+            );
         }
     }
     artifacts
@@ -224,11 +164,7 @@ fn add_command_expectations(
 }
 
 fn owned(path: PathBuf, content: &str) -> ArtifactExpectation {
-    ArtifactExpectation {
-        path,
-        owned: true,
-        expected: ArtifactMatch::Exact(content.to_string()),
-    }
+    ArtifactExpectation::exact(path, content)
 }
 
 fn render_json(value: &Value) -> String {
@@ -253,40 +189,52 @@ fn opencode_package() -> Value {
     })
 }
 
+/// Install or repair one client integration.
+///
+/// Changed paths are returned in stable installation order: target-owned core artifacts,
+/// shared configuration, target-owned agents, then phase commands where applicable.
+///
+/// # Errors
+///
+/// Returns an error before any owned writes when shared JSON cannot be read, parsed, or shaped
+/// into the target's required container. Filesystem write failures are also returned.
 pub fn install(target: Target, home: &Path) -> Result<Vec<String>> {
-    let mut changed = install_owned_artifacts(target, home)?;
-    for artifact in artifact_expectations(target, home)
-        .into_iter()
-        .filter(|artifact| !artifact.owned)
-    {
+    let artifacts = artifact_expectations(target, home);
+    let mut shared = std::collections::HashMap::new();
+    for artifact in artifacts.iter().filter(|artifact| !artifact.owned) {
         let mut root = read_json_or_default(&artifact.path)?;
-        match &artifact.expected {
-            ArtifactMatch::CodexHook => ensure_codex_pretool_hook(&mut root),
-            ArtifactMatch::GeminiEnablement { home_glob } => {
-                ensure_gemini_enablement(&mut root, home_glob)
-            }
-            ArtifactMatch::OpencodePlugin { plugin_ref } => {
-                ensure_opencode_plugin_entry(&mut root, plugin_ref)?
-            }
-            ArtifactMatch::Exact(_) => unreachable!("owned artifacts were filtered out"),
-        }
-        if write_json_if_changed(&artifact.path, &root)? {
+        prepare_shared_artifact(&artifact.expected, &mut root)?;
+        shared.insert(artifact.path.clone(), root);
+    }
+
+    let mut changed = Vec::new();
+    for artifact in artifacts {
+        let changed_artifact = match artifact.expected {
+            ArtifactMatch::Exact(content) => write_if_changed(&artifact.path, &content)?,
+            _ => write_json_if_changed(
+                &artifact.path,
+                shared
+                    .get(&artifact.path)
+                    .expect("shared artifact was preflighted"),
+            )?,
+        };
+        if changed_artifact {
             changed.push(artifact.path.display().to_string());
         }
     }
     Ok(changed)
 }
 
-fn install_owned_artifacts(target: Target, home: &Path) -> Result<Vec<String>> {
-    let mut changed = Vec::new();
-    for artifact in artifact_expectations(target, home) {
-        if let ArtifactMatch::Exact(content) = artifact.expected
-            && write_if_changed(&artifact.path, &content)?
-        {
-            changed.push(artifact.path.display().to_string());
+fn prepare_shared_artifact(expected: &ArtifactMatch, root: &mut Value) -> Result<()> {
+    match expected {
+        ArtifactMatch::CodexHook => ensure_codex_pretool_hook(root),
+        ArtifactMatch::GeminiEnablement { home_glob } => ensure_gemini_enablement(root, home_glob),
+        ArtifactMatch::OpencodePlugin { plugin_ref } => {
+            ensure_opencode_plugin_entry(root, plugin_ref)?
         }
+        ArtifactMatch::Exact(_) => unreachable!("owned artifacts do not require preflight"),
     }
-    Ok(changed)
+    Ok(())
 }
 
 fn render_phase_command(target: Target, command: &PhaseCommand) -> String {
@@ -464,7 +412,7 @@ fn ensure_codex_pretool_hook(root: &mut Value) {
                 arr.iter().any(|h| {
                     h.get("command")
                         .and_then(Value::as_str)
-                        .is_some_and(|cmd| cmd.trim() == "opavs guard")
+                        .is_some_and(is_opavs_guard_command)
                 })
             })
             .unwrap_or(false);
@@ -484,24 +432,6 @@ fn ensure_codex_pretool_hook(root: &mut Value) {
             ]
         }));
     }
-}
-
-fn has_codex_pretool_hook(root: &Value) -> bool {
-    root.pointer("/hooks/PreToolUse")
-        .and_then(Value::as_array)
-        .is_some_and(|pretool| {
-            pretool.iter().any(|entry| {
-                entry.get("matcher").and_then(Value::as_str) == Some("Edit|Write|Bash")
-                    && entry
-                        .get("hooks")
-                        .and_then(Value::as_array)
-                        .is_some_and(|hooks| {
-                            hooks.iter().any(|hook| {
-                                hook.get("command").and_then(Value::as_str) == Some("opavs guard")
-                            })
-                        })
-            })
-        })
 }
 
 fn ensure_gemini_enablement(root: &mut Value, home_glob: &str) {
@@ -527,16 +457,6 @@ fn ensure_gemini_enablement(root: &mut Value, home_glob: &str) {
     }
 }
 
-fn has_gemini_enablement(root: &Value, home_glob: &str) -> bool {
-    root.pointer("/opavs/overrides")
-        .and_then(Value::as_array)
-        .is_some_and(|overrides| {
-            overrides
-                .iter()
-                .any(|override_path| override_path.as_str() == Some(home_glob))
-        })
-}
-
 fn ensure_opencode_plugin_entry(root: &mut Value, plugin_ref: &str) -> Result<()> {
     let obj = ensure_root_object(root);
     let plugin = obj
@@ -550,16 +470,6 @@ fn ensure_opencode_plugin_entry(root: &mut Value, plugin_ref: &str) -> Result<()
         plugin_arr.push(Value::String(plugin_ref.to_string()));
     }
     Ok(())
-}
-
-fn has_opencode_plugin_entry(root: &Value, plugin_ref: &str) -> bool {
-    root.get("plugin")
-        .and_then(Value::as_array)
-        .is_some_and(|plugins| {
-            plugins
-                .iter()
-                .any(|plugin| plugin.as_str() == Some(plugin_ref))
-        })
 }
 
 fn read_json_or_default(path: &Path) -> Result<Value> {
@@ -855,6 +765,75 @@ mod tests {
 
         assert!(error.to_string().contains("plugin"));
         assert_eq!(std::fs::read_to_string(cfg).unwrap(), original);
+    }
+
+    #[test]
+    fn opencode_install_preflights_malformed_shared_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = tmp.path().join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(config.parent().expect("config parent"))
+            .expect("create config parent");
+        std::fs::write(&config, "not json\n").expect("write malformed config");
+
+        install(Target::Opencode, tmp.path()).expect_err("malformed config must fail");
+
+        assert!(!tmp.path().join(".config/opencode/plugins/opavs").exists());
+        assert!(!tmp.path().join(".config/opencode/commands").exists());
+        assert!(!tmp.path().join(".config/opencode/agents").exists());
+    }
+
+    #[test]
+    fn opencode_install_preflights_invalid_plugin_container() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = tmp.path().join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(config.parent().expect("config parent"))
+            .expect("create config parent");
+        std::fs::write(&config, "{\"plugin\":\"invalid\"}\n").expect("write invalid config");
+
+        install(Target::Opencode, tmp.path()).expect_err("invalid plugin container must fail");
+
+        assert!(!tmp.path().join(".config/opencode/plugins/opavs").exists());
+        assert!(!tmp.path().join(".config/opencode/commands").exists());
+        assert!(!tmp.path().join(".config/opencode/agents").exists());
+    }
+
+    #[test]
+    fn install_changed_paths_follow_artifact_order() {
+        for (target, expected_prefix) in [
+            (
+                Target::Codex,
+                vec![
+                    ".agents/skills/opavs/SKILL.md",
+                    ".codex/hooks.json",
+                    ".codex/commands/opavs-orient.md",
+                ],
+            ),
+            (
+                Target::Opencode,
+                vec![
+                    ".config/opencode/plugins/opavs/package.json",
+                    ".config/opencode/plugins/opavs/index.js",
+                    ".config/opencode/plugins/opavs/skills/opavs/SKILL.md",
+                    ".config/opencode/opencode.json",
+                    ".config/opencode/agents/opavs-orient.md",
+                ],
+            ),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let changed = install(target, tmp.path()).expect("install target");
+            let relative: Vec<_> = changed
+                .iter()
+                .map(|path| {
+                    Path::new(path)
+                        .strip_prefix(tmp.path())
+                        .expect("path under home")
+                        .to_path_buf()
+                })
+                .collect();
+            let expected: Vec<_> = expected_prefix.iter().map(Path::new).collect();
+
+            assert_eq!(&relative[..expected.len()], expected);
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use opavs::adapters::{FsArtifactReader, FsPhaseStore, FsTaskStore};
+use opavs::adapters::{FsArtifactReader, FsPhaseStore, FsTaskStore, GitIgnoreQuery};
 use opavs::domain::{self, Phase, PhaseStore, TaskStatus, TaskStore};
 use opavs::{doctor, guard, import, init, plugin, repo, upgrade};
 use std::env;
@@ -209,12 +209,7 @@ fn main() -> Result<()> {
 
                 for t in targets {
                     let changed = plugin::install(t, &home)?;
-                    let label = match t {
-                        plugin::Target::Claude => "claude",
-                        plugin::Target::Codex => "codex",
-                        plugin::Target::Gemini => "gemini",
-                        plugin::Target::Opencode => "opencode",
-                    };
+                    let label = t.as_str();
                     if changed.is_empty() {
                         println!("{label}: already up to date");
                     } else {
@@ -240,7 +235,13 @@ fn main() -> Result<()> {
                 .ok_or_else(|| {
                     anyhow::anyhow!("unable to resolve home directory; pass --home explicitly")
                 })?;
-            let report = doctor::inspect(&FsArtifactReader, &repo_root, &home)?;
+            let report = doctor::inspect(
+                &FsArtifactReader,
+                &GitIgnoreQuery,
+                &plugin::PluginCatalog,
+                &repo_root,
+                &home,
+            )?;
             render_doctor_report(&report);
             if report.has_errors() {
                 bail!("doctor found errors");
@@ -256,22 +257,23 @@ fn render_doctor_report(report: &doctor::DoctorReport) {
         println!("{:?}\t{}\t{}", finding.level, finding.code, finding.message);
         if let Some(repair) = &finding.repair {
             match repair {
-                doctor::RepairAction::RunInit { repo_root } => {
+                doctor::RepairAction::RunInit { repo_root, .. } => {
                     println!(
                         "  repair: opavs init {}",
                         shell_quote(&repo_root.display().to_string())
                     );
                 }
-                doctor::RepairAction::InstallPlugin { target, home } => {
+                doctor::RepairAction::InstallPlugin { target, home, .. } => {
                     println!(
                         "  repair: opavs plugin install {} --home {}",
                         target.as_str(),
                         shell_quote(&home.display().to_string())
                     );
                 }
-                doctor::RepairAction::Manual { description } => {
+                doctor::RepairAction::Manual { description, .. } => {
                     println!("  repair: {description}");
                 }
+                _ => println!("  repair: update opavs for this repair action"),
             }
         }
     }

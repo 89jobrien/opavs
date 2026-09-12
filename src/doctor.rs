@@ -1,21 +1,56 @@
+//! Read-only diagnostics for repository state and installed client integrations.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use opavs::adapters::{FsArtifactReader, GitIgnoreQuery};
+//! use opavs::doctor;
+//! use opavs::plugin::PluginCatalog;
+//! use std::path::Path;
+//!
+//! # fn main() -> anyhow::Result<()> {
+//! let report = doctor::inspect(
+//!     &FsArtifactReader,
+//!     &GitIgnoreQuery,
+//!     &PluginCatalog,
+//!     Path::new("."),
+//!     Path::new("/home/user"),
+//! )?;
+//! if report.has_errors() {
+//!     eprintln!("OPAVS requires repair");
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
+use crate::integration::{IntegrationCatalog, Target};
 use crate::{domain, domain::TaskGraph};
-use crate::{plugin, plugin::Target};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 /// Read-only access to an artifact that may not exist.
 pub trait ArtifactReader {
     /// Return an artifact's text, or `None` when the path does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact exists but cannot be read as text.
     fn read(&self, path: &Path) -> Result<Option<String>>;
+}
 
+/// Read-only Git ignore decisions used by repository diagnostics.
+pub trait IgnoreQuery {
     /// Return Git's ignore decision, or `None` when the path is not in a Git repository.
-    fn is_ignored(&self, _repo_root: &Path, _relative_path: &Path) -> Result<Option<bool>> {
-        Ok(None)
-    }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying ignore query cannot execute or Git rejects it.
+    fn is_ignored(&self, repo_root: &Path, relative_path: &Path) -> Result<Option<bool>>;
 }
 
 /// Severity assigned to a doctor finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FindingLevel {
     /// The inspected requirement is satisfied.
     Pass,
@@ -27,17 +62,22 @@ pub enum FindingLevel {
 
 /// A read-only repair recommendation emitted by doctor.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RepairAction {
     /// Initialize OPAVS state in the repository.
+    #[non_exhaustive]
     RunInit { repo_root: PathBuf },
     /// Reinstall one supported client integration.
+    #[non_exhaustive]
     InstallPlugin { target: Target, home: PathBuf },
     /// Apply a repair that has no safe automated command yet.
+    #[non_exhaustive]
     Manual { description: String },
 }
 
 /// One diagnosed repository or client-integration requirement.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DoctorFinding {
     /// Stable identifier suitable for filtering diagnostic output.
     pub code: String,
@@ -51,6 +91,7 @@ pub struct DoctorFinding {
 
 /// Complete read-only diagnosis for one repository and home directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DoctorReport {
     /// Findings produced by all enabled doctor checks.
     pub findings: Vec<DoctorFinding>,
@@ -66,23 +107,38 @@ impl DoctorReport {
 }
 
 /// Inspect OPAVS repository state without changing files.
+///
+/// # Errors
+///
+/// Returns an error when repository or integration artifacts cannot be read or the injected Git
+/// ignore query fails. Malformed task YAML is represented as a finding in the returned report.
 pub fn inspect(
-    reader: &impl ArtifactReader,
+    reader: &dyn ArtifactReader,
+    ignore: &dyn IgnoreQuery,
+    catalog: &dyn IntegrationCatalog,
     repo_root: &Path,
     home: &Path,
 ) -> Result<DoctorReport> {
+    let mut findings = Vec::new();
+    findings.push(inspect_task_graph(reader, repo_root)?);
+    findings.extend(inspect_scaffold(reader, repo_root)?);
+    findings.extend(inspect_phase_state(reader, repo_root)?);
+    findings.push(inspect_phase_ignore(reader, ignore, repo_root)?);
+    findings.extend(inspect_plugins(reader, catalog, home)?);
+    Ok(DoctorReport { findings })
+}
+
+fn inspect_task_graph(reader: &dyn ArtifactReader, repo_root: &Path) -> Result<DoctorFinding> {
     let active_context_path = repo_root.join(".ctx/opavs/memory-bank/active-context.md");
     let progress_path = repo_root.join(".ctx/opavs/memory-bank/progress.md");
     let opavs_path = repo_root.join("OPAVS.md");
-    let agents = reader.read(&repo_root.join("AGENTS.md"))?;
-    let claude = reader.read(&repo_root.join("CLAUDE.md"))?;
     let active_context = reader.read(&active_context_path)?;
     let progress = reader.read(&progress_path)?;
     let opavs = reader.read(&opavs_path)?;
     let has_partial_scaffold = active_context.is_some() || progress.is_some() || opavs.is_some();
 
     let tasks_path = repo_root.join(".ctx/opavs/tasks.yaml");
-    let mut findings = vec![match reader.read(&tasks_path)? {
+    Ok(match reader.read(&tasks_path)? {
         None => DoctorFinding {
             code: "repo.tasks.missing".to_string(),
             level: FindingLevel::Error,
@@ -101,41 +157,33 @@ pub fn inspect(
             }),
         },
         Some(contents) => match serde_yaml::from_str::<TaskGraph>(&contents) {
-            Ok(graph) => {
-                if let Some(id) = duplicate_task_id(&graph) {
-                    DoctorFinding {
-                        code: "repo.tasks.duplicate_id".to_string(),
-                        level: FindingLevel::Error,
-                        message: format!("task graph contains duplicate id '{id}'"),
-                        repair: Some(RepairAction::Manual {
-                            description: format!(
-                                "make task IDs unique in {}",
-                                tasks_path.display()
-                            ),
-                        }),
-                    }
-                } else {
-                    match domain::validate(&graph) {
-                        Ok(()) => DoctorFinding {
-                            code: "repo.tasks.valid".to_string(),
-                            level: FindingLevel::Pass,
-                            message: format!("task graph contains {} task(s)", graph.tasks.len()),
-                            repair: None,
-                        },
-                        Err(error) => DoctorFinding {
-                            code: "repo.tasks.invalid_graph".to_string(),
-                            level: FindingLevel::Error,
-                            message: format!("task graph is invalid: {error}"),
-                            repair: Some(RepairAction::Manual {
-                                description: format!(
-                                    "repair task dependencies in {}",
-                                    tasks_path.display()
-                                ),
-                            }),
-                        },
-                    }
-                }
-            }
+            Ok(graph) => match domain::validate(&graph) {
+                Ok(()) => DoctorFinding {
+                    code: "repo.tasks.valid".to_string(),
+                    level: FindingLevel::Pass,
+                    message: format!("task graph contains {} task(s)", graph.tasks.len()),
+                    repair: None,
+                },
+                Err(domain::GraphError::DuplicateId(id)) => DoctorFinding {
+                    code: "repo.tasks.duplicate_id".to_string(),
+                    level: FindingLevel::Error,
+                    message: format!("task graph contains duplicate id '{id}'"),
+                    repair: Some(RepairAction::Manual {
+                        description: format!("make task IDs unique in {}", tasks_path.display()),
+                    }),
+                },
+                Err(error) => DoctorFinding {
+                    code: "repo.tasks.invalid_graph".to_string(),
+                    level: FindingLevel::Error,
+                    message: format!("task graph is invalid: {error}"),
+                    repair: Some(RepairAction::Manual {
+                        description: format!(
+                            "repair task dependencies in {}",
+                            tasks_path.display()
+                        ),
+                    }),
+                },
+            },
             Err(error) => DoctorFinding {
                 code: "repo.tasks.invalid".to_string(),
                 level: FindingLevel::Error,
@@ -145,7 +193,19 @@ pub fn inspect(
                 }),
             },
         },
-    }];
+    })
+}
+
+fn inspect_scaffold(reader: &dyn ArtifactReader, repo_root: &Path) -> Result<Vec<DoctorFinding>> {
+    let active_context_path = repo_root.join(".ctx/opavs/memory-bank/active-context.md");
+    let progress_path = repo_root.join(".ctx/opavs/memory-bank/progress.md");
+    let opavs_path = repo_root.join("OPAVS.md");
+    let agents = reader.read(&repo_root.join("AGENTS.md"))?;
+    let claude = reader.read(&repo_root.join("CLAUDE.md"))?;
+    let active_context = reader.read(&active_context_path)?;
+    let progress = reader.read(&progress_path)?;
+    let opavs = reader.read(&opavs_path)?;
+    let mut findings = Vec::new();
 
     for (path, contents, code, label) in [
         (
@@ -213,7 +273,15 @@ pub fn inspect(
         }
     });
 
+    Ok(findings)
+}
+
+fn inspect_phase_state(
+    reader: &dyn ArtifactReader,
+    repo_root: &Path,
+) -> Result<Vec<DoctorFinding>> {
     let phase_path = repo_root.join(".ctx/opavs/phase");
+    let mut findings = Vec::new();
     if let Some(contents) = reader.read(&phase_path)? {
         findings.push(match domain::Phase::parse(contents.trim()) {
             Ok(phase) => DoctorFinding {
@@ -232,16 +300,23 @@ pub fn inspect(
             },
         });
     }
+    Ok(findings)
+}
 
+fn inspect_phase_ignore(
+    reader: &dyn ArtifactReader,
+    ignore: &dyn IgnoreQuery,
+    repo_root: &Path,
+) -> Result<DoctorFinding> {
     let gitignore_path = repo_root.join(".gitignore");
-    let phase_ignored = match reader.is_ignored(repo_root, Path::new(".ctx/opavs/phase"))? {
+    let phase_ignored = match ignore.is_ignored(repo_root, Path::new(".ctx/opavs/phase"))? {
         Some(ignored) => ignored,
         None => reader
             .read(&gitignore_path)?
             .as_deref()
             .is_some_and(gitignore_covers_phase),
     };
-    findings.push(if phase_ignored {
+    Ok(if phase_ignored {
         DoctorFinding {
             code: "repo.phase.ignored".to_string(),
             level: FindingLevel::Pass,
@@ -257,17 +332,17 @@ pub fn inspect(
                 description: format!("add .ctx/opavs/phase to {}", gitignore_path.display()),
             }),
         }
-    });
-
-    findings.extend(inspect_plugins(reader, home)?);
-
-    Ok(DoctorReport { findings })
+    })
 }
 
-fn inspect_plugins(reader: &impl ArtifactReader, home: &Path) -> Result<Vec<DoctorFinding>> {
+fn inspect_plugins(
+    reader: &dyn ArtifactReader,
+    catalog: &dyn IntegrationCatalog,
+    home: &Path,
+) -> Result<Vec<DoctorFinding>> {
     let mut findings = Vec::new();
     for target in Target::ALL {
-        let expectations = plugin::artifact_expectations(target, home);
+        let expectations = catalog.artifacts(target, home);
         let mut installed = false;
         let mut drifted = Vec::new();
 
@@ -319,15 +394,6 @@ fn inspect_plugins(reader: &impl ArtifactReader, home: &Path) -> Result<Vec<Doct
     Ok(findings)
 }
 
-fn duplicate_task_id(graph: &TaskGraph) -> Option<&str> {
-    let mut ids = std::collections::HashSet::new();
-    graph
-        .tasks
-        .iter()
-        .map(|task| task.id.as_str())
-        .find(|id| !ids.insert(*id))
-}
-
 fn gitignore_covers_phase(contents: &str) -> bool {
     contents
         .lines()
@@ -337,6 +403,8 @@ fn gitignore_covers_phase(contents: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integration::{ArtifactExpectation, IntegrationCatalog};
+    use anyhow::anyhow;
 
     struct TasksReader {
         tasks: &'static str,
@@ -350,12 +418,121 @@ mod tests {
         }
     }
 
+    struct NoIgnore;
+
+    impl IgnoreQuery for NoIgnore {
+        fn is_ignored(&self, _repo_root: &Path, _relative_path: &Path) -> Result<Option<bool>> {
+            Ok(None)
+        }
+    }
+
+    struct FailingReader {
+        suffix: &'static str,
+    }
+
+    impl ArtifactReader for FailingReader {
+        fn read(&self, path: &Path) -> Result<Option<String>> {
+            if path.ends_with(self.suffix) {
+                return Err(anyhow!("read failed for {}", path.display()));
+            }
+            Ok(path
+                .ends_with(".ctx/opavs/tasks.yaml")
+                .then(|| "tasks: []\n".to_string()))
+        }
+    }
+
+    struct FailingIgnore;
+
+    impl IgnoreQuery for FailingIgnore {
+        fn is_ignored(&self, _repo_root: &Path, _relative_path: &Path) -> Result<Option<bool>> {
+            Err(anyhow!("ignore query failed"))
+        }
+    }
+
+    struct EmptyCatalog;
+
+    impl IntegrationCatalog for EmptyCatalog {
+        fn artifacts(&self, _target: Target, _home: &Path) -> Vec<ArtifactExpectation> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn inspect_accepts_trait_object_ports() {
+        let reader: &dyn ArtifactReader = &TasksReader {
+            tasks: "tasks: []\n",
+        };
+        let ignore: &dyn IgnoreQuery = &NoIgnore;
+        let catalog: &dyn IntegrationCatalog = &EmptyCatalog;
+
+        assert!(
+            inspect(
+                reader,
+                ignore,
+                catalog,
+                Path::new("/repo"),
+                Path::new("/home")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn inspect_propagates_repository_read_error() {
+        let error = inspect(
+            &FailingReader {
+                suffix: "AGENTS.md",
+            },
+            &NoIgnore,
+            &EmptyCatalog,
+            Path::new("/repo"),
+            Path::new("/home"),
+        )
+        .expect_err("repository read should fail");
+
+        assert!(error.to_string().contains("AGENTS.md"));
+    }
+
+    #[test]
+    fn inspect_propagates_plugin_read_error() {
+        let error = inspect(
+            &FailingReader {
+                suffix: ".agents/skills/opavs/SKILL.md",
+            },
+            &NoIgnore,
+            &crate::plugin::PluginCatalog,
+            Path::new("/repo"),
+            Path::new("/home"),
+        )
+        .expect_err("plugin read should fail");
+
+        assert!(error.to_string().contains("SKILL.md"));
+    }
+
+    #[test]
+    fn inspect_propagates_ignore_query_error() {
+        let error = inspect(
+            &TasksReader {
+                tasks: "tasks: []\n",
+            },
+            &FailingIgnore,
+            &EmptyCatalog,
+            Path::new("/repo"),
+            Path::new("/home"),
+        )
+        .expect_err("ignore query should fail");
+
+        assert!(error.to_string().contains("ignore query failed"));
+    }
+
     #[test]
     fn inspect_malformed_tasks_reports_error() {
         let report = inspect(
             &TasksReader {
                 tasks: "tasks: [not-valid",
             },
+            &NoIgnore,
+            &EmptyCatalog,
             Path::new("/repo"),
             Path::new("/home"),
         )
@@ -376,6 +553,8 @@ mod tests {
             &TasksReader {
                 tasks: "tasks:\n  - id: a\n    depends_on: [missing]\n",
             },
+            &NoIgnore,
+            &EmptyCatalog,
             Path::new("/repo"),
             Path::new("/home"),
         )
@@ -396,6 +575,8 @@ mod tests {
             &TasksReader {
                 tasks: "tasks:\n  - id: duplicate\n  - id: duplicate\n",
             },
+            &NoIgnore,
+            &EmptyCatalog,
             Path::new("/repo"),
             Path::new("/home"),
         )
