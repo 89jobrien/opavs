@@ -370,3 +370,192 @@ fn plugin_install_codex_writes_into_custom_home() {
         .success()
         .stdout(predicates::str::contains("codex: already up to date"));
 }
+
+#[test]
+fn doctor_codex_whitespace_guard_converges_after_install() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    let hooks = home.path().join(".codex/hooks.json");
+    fs::create_dir_all(hooks.parent().expect("hooks parent")).expect("create hooks parent");
+    fs::write(
+        &hooks,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Edit|Write|Bash","hooks":[{"command":" opavs guard "}]}]}}"#,
+    )
+    .expect("write hooks");
+
+    opavs()
+        .args(["plugin", "install", "codex", "--home"])
+        .arg(home.path())
+        .assert()
+        .success();
+
+    doctor(repo.path(), home.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("plugin.codex.current"));
+}
+
+#[test]
+fn doctor_reports_valid_persisted_phase() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    fs::write(repo.path().join(".ctx/opavs/phase"), "VERIFY\n").expect("write phase");
+
+    doctor(repo.path(), home.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("repo.phase.valid"))
+        .stdout(predicates::str::contains("current phase is VERIFY"));
+}
+
+#[test]
+fn doctor_reports_invalid_persisted_phase_with_manual_repair() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    fs::write(repo.path().join(".ctx/opavs/phase"), "BROKEN\n").expect("write phase");
+
+    doctor(repo.path(), home.path())
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("repo.phase.invalid"))
+        .stdout(predicates::str::contains("repair: remove or repair"));
+}
+
+#[test]
+fn doctor_uses_current_directory_as_implicit_repo_root() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+
+    opavs()
+        .current_dir(repo.path())
+        .arg("doctor")
+        .arg("--home")
+        .arg(home.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("repo.tasks.valid"));
+}
+
+#[test]
+fn doctor_resolves_home_from_command_environment() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    opavs()
+        .args(["plugin", "install", "gemini", "--home"])
+        .arg(home.path())
+        .assert()
+        .success();
+
+    opavs()
+        .arg("doctor")
+        .arg(repo.path())
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("plugin.gemini.current"));
+}
+
+#[test]
+fn doctor_errors_when_home_is_unavailable() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+
+    opavs()
+        .arg("doctor")
+        .arg(repo.path())
+        .env_remove("HOME")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "unable to resolve home directory; pass --home explicitly",
+        ));
+}
+
+fn install_target(target: &str, home: &Path) {
+    opavs()
+        .args(["plugin", "install", target, "--home"])
+        .arg(home)
+        .assert()
+        .success();
+}
+
+fn assert_drift_then_repair(repo: &Path, home: &Path, target: &str) {
+    doctor(repo, home)
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains(format!("plugin.{target}.drift")));
+    install_target(target, home);
+    doctor(repo, home)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(format!(
+            "plugin.{target}.current"
+        )));
+}
+
+#[test]
+fn doctor_gemini_owned_drift_repair_converges() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    install_target("gemini", home.path());
+    fs::write(
+        home.path()
+            .join(".gemini/extensions/opavs/gemini-extension.json"),
+        "{}\n",
+    )
+    .expect("corrupt descriptor");
+
+    assert_drift_then_repair(repo.path(), home.path(), "gemini");
+}
+
+#[test]
+fn doctor_gemini_shared_drift_repair_converges() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    install_target("gemini", home.path());
+    fs::write(
+        home.path()
+            .join(".gemini/extensions/extension-enablement.json"),
+        "{\"opavs\":{\"overrides\":[]}}\n",
+    )
+    .expect("corrupt enablement");
+
+    assert_drift_then_repair(repo.path(), home.path(), "gemini");
+}
+
+#[test]
+fn doctor_opencode_owned_drift_repair_converges() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    install_target("opencode", home.path());
+    fs::write(
+        home.path().join(".config/opencode/plugins/opavs/index.js"),
+        "// stale\n",
+    )
+    .expect("corrupt plugin");
+
+    assert_drift_then_repair(repo.path(), home.path(), "opencode");
+}
+
+#[test]
+fn doctor_opencode_shared_drift_repair_converges() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    opavs().arg("init").arg(repo.path()).assert().success();
+    install_target("opencode", home.path());
+    fs::write(
+        home.path().join(".config/opencode/opencode.json"),
+        "{\"plugin\":[\"opavs@file://stale\"]}\n",
+    )
+    .expect("corrupt plugin reference");
+
+    assert_drift_then_repair(repo.path(), home.path(), "opencode");
+}

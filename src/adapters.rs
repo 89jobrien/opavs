@@ -1,6 +1,6 @@
-use crate::doctor::ArtifactReader;
+use crate::doctor::{ArtifactReader, IgnoreQuery};
 use crate::domain::{Phase, PhaseStore, TaskGraph, TaskStore};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -15,22 +15,35 @@ impl ArtifactReader for FsArtifactReader {
         }
         Ok(Some(std::fs::read_to_string(path)?))
     }
+}
 
+/// Git-backed adapter for read-only ignore decisions.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitIgnoreQuery;
+
+impl IgnoreQuery for GitIgnoreQuery {
     fn is_ignored(&self, repo_root: &Path, relative_path: &Path) -> Result<Option<bool>> {
         if !repo_root.join(".git").exists() {
             return Ok(None);
         }
-        let status = Command::new("git")
+        let output = Command::new("git")
             .arg("-C")
             .arg(repo_root)
             .args(["check-ignore", "--quiet", "--no-index"])
             .arg(relative_path)
-            .status()?;
-        Ok(match status.code() {
-            Some(0) => Some(true),
-            Some(1) => Some(false),
-            _ => None,
-        })
+            .output()
+            .with_context(|| format!("run git check-ignore in {}", repo_root.display()))?;
+        let ignored = match output.status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            code => bail!(
+                "git check-ignore failed in {} with status {:?}: {}",
+                repo_root.display(),
+                code,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        };
+        Ok(Some(ignored))
     }
 }
 
@@ -106,6 +119,118 @@ impl TaskStore for FsTaskStore {
 mod tests {
     use super::*;
     use crate::domain::{Task, TaskStatus};
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    #[test]
+    fn fs_artifact_reader_reads_present_and_missing_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let present = tmp.path().join("present.txt");
+        std::fs::write(&present, "present\n").expect("write text");
+
+        assert_eq!(
+            FsArtifactReader.read(&present).expect("read present"),
+            Some("present\n".to_string())
+        );
+        assert_eq!(
+            FsArtifactReader
+                .read(&tmp.path().join("missing.txt"))
+                .expect("read missing"),
+            None
+        );
+    }
+
+    #[test]
+    fn fs_artifact_reader_rejects_non_utf8_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("binary");
+        std::fs::write(&path, [0xff, 0xfe]).expect("write binary");
+
+        assert!(FsArtifactReader.read(&path).is_err());
+    }
+
+    #[test]
+    fn git_ignore_query_reports_true_and_false() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(tmp.path(), &["init", "--quiet"]);
+        std::fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").expect("write gitignore");
+
+        assert_eq!(
+            GitIgnoreQuery
+                .is_ignored(tmp.path(), Path::new("ignored.txt"))
+                .expect("ignored query"),
+            Some(true)
+        );
+        assert_eq!(
+            GitIgnoreQuery
+                .is_ignored(tmp.path(), Path::new("visible.txt"))
+                .expect("visible query"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn git_ignore_query_propagates_git_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".git"), "gitdir: /missing/opavs-git-dir\n")
+            .expect("write invalid git file");
+
+        let error = GitIgnoreQuery
+            .is_ignored(tmp.path(), Path::new("anything"))
+            .expect_err("invalid Git metadata should fail");
+        assert!(error.to_string().contains("git check-ignore"));
+    }
+
+    #[test]
+    fn git_ignore_query_supports_worktree_git_file() {
+        let root = tempfile::tempdir().expect("root tempdir");
+        let repo = root.path().join("repo");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir(&repo).expect("create repo");
+        git(&repo, &["init", "--quiet"]);
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n").expect("write gitignore");
+        std::fs::write(repo.join("tracked.txt"), "tracked\n").expect("write tracked file");
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=OPAVS Test",
+                "-c",
+                "user.email=opavs@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                worktree.to_str().expect("UTF-8 path"),
+            ],
+        );
+
+        assert!(worktree.join(".git").is_file());
+        assert_eq!(
+            GitIgnoreQuery
+                .is_ignored(&worktree, Path::new("ignored.txt"))
+                .expect("worktree ignore query"),
+            Some(true)
+        );
+    }
 
     #[test]
     fn phase_store_defaults_to_orient_when_unset() {

@@ -116,7 +116,7 @@ pub trait TaskStore {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum GraphError {
-    // TODO(task-id-validation): Reject duplicate task IDs before set/map construction obscures them.
+    DuplicateId(String),
     UnknownDependency { task: String, depends_on: String },
     Cycle(Vec<String>),
 }
@@ -124,6 +124,7 @@ pub enum GraphError {
 impl fmt::Display for GraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            GraphError::DuplicateId(id) => write!(f, "duplicate task id '{id}'"),
             GraphError::UnknownDependency { task, depends_on } => {
                 write!(f, "task '{task}' depends on unknown task '{depends_on}'")
             }
@@ -132,9 +133,14 @@ impl fmt::Display for GraphError {
     }
 }
 
-/// Pure domain logic: validate a task graph (unknown deps, cycles).
+/// Pure domain logic: validate a task graph (unique IDs, known deps, and no cycles).
 pub fn validate(graph: &TaskGraph) -> Result<(), GraphError> {
-    let ids: std::collections::HashSet<&str> = graph.tasks.iter().map(|t| t.id.as_str()).collect();
+    let mut ids = std::collections::HashSet::new();
+    for task in &graph.tasks {
+        if !ids.insert(task.id.as_str()) {
+            return Err(GraphError::DuplicateId(task.id.clone()));
+        }
+    }
 
     for task in &graph.tasks {
         for dep in &task.depends_on {
@@ -334,6 +340,21 @@ mod tests {
                 task: "a".into(),
                 depends_on: "ghost".into()
             }
+        );
+    }
+
+    #[test]
+    fn validate_detects_duplicate_id() {
+        let graph = TaskGraph {
+            tasks: vec![
+                task("duplicate", TaskStatus::Todo, &[]),
+                task("duplicate", TaskStatus::Done, &[]),
+            ],
+        };
+
+        assert_eq!(
+            validate(&graph),
+            Err(GraphError::DuplicateId("duplicate".to_string()))
         );
     }
 
