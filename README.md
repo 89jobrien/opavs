@@ -49,6 +49,24 @@ opavs doctor [repo_root] [--home /path/to/home]
 opavs upgrade               # download and install the newest GitHub release
 ```
 
+### Doctor
+
+`opavs doctor` performs a read-only diagnosis of the repository scaffold, task
+graph, ephemeral phase state, and supported client integrations. Its filesystem-
+and Git-backed adapter reads configuration and uses read-only Git inspection to
+check whether phase state is ignored.
+
+Each check is reported as `Pass`, `Warning`, or `Error`. A warning identifies a
+condition worth correcting that does not by itself make enforcement untrustworthy;
+an error means OPAVS should not be relied on until it is repaired. Printed repair
+steps are advisory: doctor does not apply them or otherwise mutate inspected files.
+
+The command exits nonzero after rendering any `Error` finding. Setup failures,
+such as an unavailable home directory, and inspection failures from unreadable or
+non-UTF-8 artifacts or a failed Git process also exit nonzero and may prevent a
+report from being rendered. Malformed inspected content is normally reported as
+an `Error` finding with an advisory repair.
+
 `opavs upgrade` checks the latest `89jobrien/opavs` GitHub Release, downloads
 the archive matching the current platform, and replaces the running executable.
 It exits without changing the binary when the installed version is current.
@@ -113,10 +131,13 @@ opavs tasks import <path>             # merge an external GODMODE.tasks.yaml
 ## Architecture
 
 Hexagonal: `domain` holds `Phase`/`Task` types, the `PhaseStore`/`TaskStore`
-ports, and pure task-graph logic with zero I/O. `adapters` implements those
-ports against the filesystem; `guard` owns pure policy decisions and shell
-classification. `init`, `plugin`, and `upgrade` are filesystem/network-facing
-adapters. `main.rs` is the composition root wiring clap subcommands to them.
+ports, and pure task-graph logic with zero I/O. `doctor` is the mutation-free
+diagnosis and repair-planning service. `adapters` implements state ports against
+the filesystem and backs doctor with filesystem reads plus read-only Git ignore
+queries. `guard` owns pure policy decisions and shell classification. `init`,
+`plugin`, and `upgrade` are filesystem/network-facing adapters, while plugin
+installation and doctor share the same client-artifact expectations. `main.rs`
+is the composition root wiring clap subcommands to them.
 
 ## Build
 
