@@ -1,3 +1,5 @@
+//! Filesystem and Git adapters for phase, task, and diagnostic ports.
+
 use crate::doctor::{ArtifactReader, IgnoreQuery};
 use crate::domain::{Phase, PhaseStore, TaskGraph, TaskStore};
 use anyhow::{Context, Result, bail};
@@ -52,6 +54,7 @@ pub struct FsPhaseStore {
 }
 
 impl FsPhaseStore {
+    /// Stores phase state under `.ctx/opavs/phase` within `repo_root`.
     pub fn new(repo_root: impl Into<PathBuf>) -> Self {
         Self {
             repo_root: repo_root.into(),
@@ -88,6 +91,7 @@ pub struct FsTaskStore {
 }
 
 impl FsTaskStore {
+    /// Stores the task graph at `.ctx/opavs/tasks.yaml` within `repo_root`.
     pub fn new(repo_root: &Path) -> Self {
         Self {
             path: repo_root.join(".ctx").join("opavs").join("tasks.yaml"),

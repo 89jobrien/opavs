@@ -1,3 +1,5 @@
+//! Library APIs for OPAVS state, phase guards, client integrations, and repository setup.
+
 pub mod adapters;
 pub mod doctor;
 pub mod domain;

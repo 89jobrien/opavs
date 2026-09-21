@@ -20,7 +20,7 @@ is what this tool is _for_.
 
 Install from a source checkout, then install the agent integrations you use:
 
-```
+```text
 git clone https://github.com/89jobrien/opavs.git
 cargo install --path opavs
 opavs plugin install all
@@ -30,7 +30,7 @@ opavs plugin install all
 
 ### Phase discipline (core)
 
-```
+```text
 opavs init [repo_root]     # scaffold OPAVS state and update instruction files
 opavs phase get            # print current phase (defaults to ORIENT)
 opavs phase set <PHASE>    # ORIENT | PLAN | ACT | VERIFY | SHIP
@@ -118,7 +118,7 @@ not initialized will silently allow everything. Verify its own
 
 ### Task graph (optional companion)
 
-```
+```text
 opavs tasks list                      # list all tasks with status
 opavs tasks runnable                  # tasks not done, with all deps done
 opavs tasks validate                  # unknown-dependency and cycle detection
@@ -141,7 +141,7 @@ is the composition root wiring clap subcommands to them.
 
 ## Build
 
-```
+```text
 cargo check
 cargo clippy --all-targets
 cargo test

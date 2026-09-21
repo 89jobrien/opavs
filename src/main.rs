@@ -1,3 +1,5 @@
+//! Command-line interface for OPAVS state, guards, diagnostics, integrations, and upgrades.
+
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use opavs::adapters::{FsArtifactReader, FsPhaseStore, FsTaskStore, GitIgnoreQuery};

@@ -1,3 +1,5 @@
+//! Self-update support backed by OPAVS releases on GitHub.
+
 use anyhow::{Context, Result};
 
 const REPO_OWNER: &str = "89jobrien";

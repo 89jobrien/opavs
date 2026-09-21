@@ -1,3 +1,5 @@
+//! Documentation contract tests for user guides and architecture design.
+
 use std::{fs, path::PathBuf};
 
 fn repo_file(path: &str) -> String {

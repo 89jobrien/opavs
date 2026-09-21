@@ -1,3 +1,5 @@
+//! Locates OPAVS-enabled repositories without crossing Git repository boundaries.
+
 use std::path::{Path, PathBuf};
 
 /// Walk up from `start` looking for a directory containing .ctx/opavs/tasks.yaml.

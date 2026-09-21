@@ -47,7 +47,7 @@ Hexagonal (see `~/.claude/skills/writing-solid-rust`):
 
 ## Build & Test
 
-```
+```text
 cargo check
 cargo clippy --all-targets
 cargo test

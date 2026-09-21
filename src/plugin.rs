@@ -1,3 +1,5 @@
+//! Defines and installs OPAVS integration artifacts for supported agent clients.
+
 use crate::domain::Phase;
 pub use crate::integration::Target;
 use crate::integration::{

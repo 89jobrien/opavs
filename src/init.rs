@@ -1,3 +1,5 @@
+//! Scaffolds OPAVS state, memory-bank, instruction, and ignore files.
+
 use anyhow::{Result, bail};
 use std::path::Path;
 

@@ -14,7 +14,7 @@ output. Plugin installation and self-upgrade are covered by Rust tests instead.
 
 ## Build
 
-```
+```text
 cargo build
 ```
 
@@ -22,7 +22,7 @@ Produces `target/debug/opavs`.
 
 ## Run (agent path)
 
-```
+```text
 nu .claude/skills/run-opavs/smoke.nu
 ```
 
@@ -45,7 +45,7 @@ exit code, to confirm allow/deny verdicts landed where expected.
 
 Same subcommands, run directly against a real repo:
 
-```
+```text
 opavs init .
 opavs phase get
 opavs phase set ACT
@@ -56,13 +56,13 @@ opavs tasks list
 hand — it reads hook JSON on stdin and writes a `permissionDecision` verdict
 to stdout. To drive it manually, pipe JSON in:
 
-```
+```text
 '{"tool_name": "Edit", "tool_input": {"file_path": "/repo/src/main.rs"}, "cwd": "/repo"}' | opavs guard
 ```
 
 ## Test
 
-```
+```text
 cargo test
 ```
 

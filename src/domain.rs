@@ -1,3 +1,5 @@
+//! Workflow phases, task-graph types, persistence ports, and validation rules.
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -15,6 +17,7 @@ pub enum Phase {
 }
 
 impl Phase {
+    /// Parses an uppercase OPAVS phase name.
     pub fn parse(s: &str) -> Result<Phase> {
         match s {
             "ORIENT" => Ok(Phase::Orient),
@@ -75,6 +78,7 @@ fn default_status() -> TaskStatus {
 }
 
 impl TaskStatus {
+    /// Parses a task status as represented in task-graph YAML.
     pub fn parse(s: &str) -> Result<TaskStatus, String> {
         match s {
             "todo" => Ok(TaskStatus::Todo),
@@ -223,6 +227,7 @@ pub fn runnable_tasks(graph: &TaskGraph) -> Vec<&Task> {
 pub mod conformance {
     use super::*;
 
+    /// Verifies that a phase store defaults to Orient and round-trips every phase.
     pub fn assert_phase_store_contract(store: impl PhaseStore) {
         assert_eq!(
             store.get().expect("fresh store defaults to a phase"),
@@ -245,6 +250,7 @@ pub mod conformance {
         }
     }
 
+    /// Verifies that a task store defaults empty, round-trips, and overwrites on save.
     pub fn assert_task_store_contract(store: impl TaskStore) {
         assert!(
             store

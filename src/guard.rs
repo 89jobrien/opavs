@@ -1,3 +1,5 @@
+//! Pure policy decisions for phase-gated tool and shell-command execution.
+
 use crate::domain::Phase;
 
 #[derive(Debug, PartialEq, Eq)]
