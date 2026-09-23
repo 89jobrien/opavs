@@ -66,7 +66,7 @@ items in `depends_on` are done.
 
 ## Memory bank
 
-- Persistent context lives in `.ctx/opavs/memory-bank/`.
+- Persistent context lives in `.ctx/memory-bank/`.
 - Read `active-context.md` and `progress.md` before substantive work.
 - Update the memory bank after milestones and after shipping.
 - See `AGENTS.md` for repository-specific guidance.

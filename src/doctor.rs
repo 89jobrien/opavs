@@ -129,8 +129,8 @@ pub fn inspect(
 }
 
 fn inspect_task_graph(reader: &dyn ArtifactReader, repo_root: &Path) -> Result<DoctorFinding> {
-    let active_context_path = repo_root.join(".ctx/opavs/memory-bank/active-context.md");
-    let progress_path = repo_root.join(".ctx/opavs/memory-bank/progress.md");
+    let active_context_path = repo_root.join(".ctx/memory-bank/active-context.md");
+    let progress_path = repo_root.join(".ctx/memory-bank/progress.md");
     let opavs_path = repo_root.join("OPAVS.md");
     let active_context = reader.read(&active_context_path)?;
     let progress = reader.read(&progress_path)?;
@@ -197,8 +197,8 @@ fn inspect_task_graph(reader: &dyn ArtifactReader, repo_root: &Path) -> Result<D
 }
 
 fn inspect_scaffold(reader: &dyn ArtifactReader, repo_root: &Path) -> Result<Vec<DoctorFinding>> {
-    let active_context_path = repo_root.join(".ctx/opavs/memory-bank/active-context.md");
-    let progress_path = repo_root.join(".ctx/opavs/memory-bank/progress.md");
+    let active_context_path = repo_root.join(".ctx/memory-bank/active-context.md");
+    let progress_path = repo_root.join(".ctx/memory-bank/progress.md");
     let opavs_path = repo_root.join("OPAVS.md");
     let agents = reader.read(&repo_root.join("AGENTS.md"))?;
     let claude = reader.read(&repo_root.join("CLAUDE.md"))?;

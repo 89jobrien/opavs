@@ -79,7 +79,7 @@ items in `depends_on` are done.
 
 ## Memory bank
 
-- Persistent context lives in `.ctx/opavs/memory-bank/`.
+- Persistent context lives in `.ctx/memory-bank/`.
 - Read `active-context.md` and `progress.md` before substantive work.
 - Update the memory bank after milestones and after shipping.
 - See `AGENTS.md` for repository-specific guidance.
@@ -102,7 +102,7 @@ pub fn scaffold(repo_root: &Path) -> Result<Vec<String>> {
 
     let opavs_dir = repo_root.join(".ctx").join("opavs");
     let tasks_file = opavs_dir.join("tasks.yaml");
-    let memory_bank = opavs_dir.join("memory-bank");
+    let memory_bank = repo_root.join(".ctx").join("memory-bank");
     let active_context = memory_bank.join("active-context.md");
     let progress = memory_bank.join("progress.md");
     let opavs = repo_root.join("OPAVS.md");
@@ -118,6 +118,7 @@ pub fn scaffold(repo_root: &Path) -> Result<Vec<String>> {
         }
     }
 
+    std::fs::create_dir_all(&opavs_dir)?;
     std::fs::create_dir_all(&memory_bank)?;
     std::fs::write(&tasks_file, TASKS_TEMPLATE)?;
     created.push(tasks_file.display().to_string());
@@ -198,14 +199,10 @@ mod tests {
         assert!(tmp.path().join(".ctx/opavs/tasks.yaml").is_file());
         assert!(
             tmp.path()
-                .join(".ctx/opavs/memory-bank/active-context.md")
+                .join(".ctx/memory-bank/active-context.md")
                 .is_file()
         );
-        assert!(
-            tmp.path()
-                .join(".ctx/opavs/memory-bank/progress.md")
-                .is_file()
-        );
+        assert!(tmp.path().join(".ctx/memory-bank/progress.md").is_file());
         assert!(tmp.path().join("AGENTS.md").is_file());
         assert!(tmp.path().join("OPAVS.md").is_file());
         assert_eq!(
