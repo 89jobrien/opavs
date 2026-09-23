@@ -217,7 +217,8 @@ fn init_then_phase_get_defaults_to_orient() {
 
     assert!(tmp.path().join("OPAVS.md").is_file());
     let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
-    assert!(agents.contains("This repo uses the opavs"));
+    assert!(agents.contains("<!-- opavs-workflow:begin -->"));
+    assert!(agents.contains("<opavs-phase name=\"ORIENT\""));
     assert!(!agents.contains("@OPAVS.md"));
 
     opavs()
