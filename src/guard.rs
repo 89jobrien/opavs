@@ -230,14 +230,35 @@ fn classify_cargo(args: &[&str]) -> Option<Operation> {
 }
 
 fn classify_opavs(args: &[&str]) -> Option<Operation> {
+    // clap resolves --help/-h/--version/-V before dispatching to any
+    // subcommand, wherever the flag appears. So `opavs init --help` prints usage
+    // without scaffolding anything and `opavs upgrade --version` reports a
+    // version without downloading: all of these are read-only no-ops.
+    if args
+        .iter()
+        .any(|arg| matches!(*arg, "--help" | "-h" | "--version" | "-V"))
+    {
+        return Some(Operation::Inspect);
+    }
+
     Some(match (*args.first()?, args.get(1).copied()) {
         ("phase", Some("get" | "set")) => Operation::PhaseState,
         ("tasks", Some("list" | "runnable" | "validate")) => Operation::PhaseState,
         ("tasks", Some("set-status" | "import")) => Operation::TaskState,
-        ("init", _) => Operation::Mutate,
+
+        // Diagnosing without applying repairs, and turning hook JSON on stdin
+        // into a verdict, are both read-only -- and VERIFY is exactly the phase
+        // you reach for them in, so refusing them there was perverse.
+        ("doctor", _) | ("guard", _) => Operation::Inspect,
+
+        // `init` scaffolds the repository; `plugin install` writes into the
+        // user's home directory.
+        ("init", _) | ("plugin", _) => Operation::Mutate,
+
         // Replacing the installed executable is a publish action, and SHIP is
         // the only phase that permits one.
         ("upgrade", _) => Operation::Publish,
+
         _ => return None,
     })
 }
@@ -656,6 +677,68 @@ mod tests {
                 shell_command_allowed("cargo metadata --no-deps", phase),
                 "{phase:?}"
             );
+        }
+    }
+
+    const ALL_PHASES: [Phase; 5] = [
+        Phase::Orient,
+        Phase::Plan,
+        Phase::Act,
+        Phase::Verify,
+        Phase::Ship,
+    ];
+
+    #[test]
+    fn opavs_read_only_commands_are_inspectable_in_every_phase() {
+        for cmd in [
+            "opavs doctor",
+            "opavs doctor --home /tmp",
+            "opavs guard",
+            "opavs --help",
+            "opavs --version",
+            "opavs -h",
+            // clap short-circuits on the flag, so this scaffolds nothing.
+            "opavs init --help",
+        ] {
+            for phase in ALL_PHASES {
+                assert!(shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn opavs_writing_subcommands_stay_confined_to_act() {
+        for cmd in ["opavs init .", "opavs plugin install --target claude"] {
+            assert!(shell_command_allowed(cmd, Phase::Act), "{cmd}");
+            for phase in [Phase::Orient, Phase::Plan, Phase::Verify, Phase::Ship] {
+                assert!(!shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
+            }
+        }
+    }
+
+    /// Every subcommand the CLI exposes must be classified. A subcommand with no
+    /// entry falls through to "unclassified", which fails closed outside ACT --
+    /// so forgetting one does not break the build, it just makes the command
+    /// mysteriously unusable from VERIFY and SHIP. That is exactly how `doctor`,
+    /// `guard`, and `plugin` went missing until this list existed.
+    ///
+    /// Invocations must be ones clap accepts: a bare `opavs phase` is a usage
+    /// error and is correctly unclassified.
+    ///
+    /// Keep in step with the `Command` enum in `main.rs`.
+    #[test]
+    fn every_opavs_subcommand_is_classified() {
+        for cmd in [
+            "opavs init .",
+            "opavs phase get",
+            "opavs tasks list",
+            "opavs guard",
+            "opavs plugin install",
+            "opavs upgrade",
+            "opavs doctor",
+        ] {
+            let words: Vec<&str> = cmd.split_whitespace().collect();
+            assert!(classify(&words).is_some(), "unclassified: {cmd}");
         }
     }
 }

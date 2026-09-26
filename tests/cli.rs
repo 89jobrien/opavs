@@ -522,6 +522,37 @@ fn guard_allows_self_upgrade_only_from_a_publishing_phase() {
 }
 
 #[test]
+fn guard_allows_opavs_self_inspection_in_ship_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    opavs()
+        .current_dir(tmp.path())
+        .args(["phase", "set", "SHIP"])
+        .assert()
+        .success();
+
+    for command in [
+        "opavs --help",
+        "opavs --version",
+        "opavs doctor",
+        "opavs init --help",
+    ] {
+        let hook = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": tmp.path().display().to_string(),
+        });
+
+        opavs()
+            .args(["guard"])
+            .write_stdin(hook.to_string())
+            .assert()
+            .success()
+            .stdout("{\"continue\": true}\n");
+    }
+}
+
+#[test]
 fn tasks_validate_reports_cycle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     opavs().arg("init").arg(tmp.path()).assert().success();
