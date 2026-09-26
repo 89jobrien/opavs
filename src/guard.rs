@@ -67,7 +67,7 @@ fn shell_segment_allowed(segment: &str, phase: Phase) -> bool {
 
     match program {
         "opavs" => opavs_command_allowed(&words[1..], phase),
-        "git" => git_command_allowed(&words[1..]),
+        "git" => git_command_allowed(&words, phase),
         "cargo" => cargo_command_allowed(&words[1..], phase),
         "pwd" | "ls" | "rg" | "fd" | "file" | "which" => true,
         "nu" => words
@@ -89,24 +89,38 @@ fn opavs_command_allowed(args: &[&str], phase: Phase) -> bool {
     }
 }
 
-fn git_command_allowed(args: &[&str]) -> bool {
-    let args = if matches!(args.first(), Some(&"-C")) && args.len() >= 3 {
-        &args[2..]
-    } else {
-        args
+fn git_command_allowed(words: &[&str], phase: Phase) -> bool {
+    let Some(git) = git_invocation(words) else {
+        // A bare `git`, or a program that is not git at all.
+        return false;
     };
+    let args = &words[git.index + 1..];
 
-    matches!(
-        args,
-        ["status", ..]
-            | ["diff", ..]
-            | ["log", ..]
-            | ["show", ..]
-            | ["rev-parse", ..]
-            | ["branch"]
-            | ["branch", "--show-current"]
-            | ["remote", "-v"]
-    )
+    match git.subcommand {
+        // Read-only inspection: safe in any phase that forbids mutations.
+        "status" | "diff" | "log" | "show" | "rev-parse" => true,
+
+        // Listing is read-only but the mutating forms are not, so these two stay
+        // argument-sensitive: `git branch -d` deletes a branch and
+        // `git remote add` rewrites config.
+        "branch" => args.is_empty() || args == ["--show-current"],
+        "remote" => args == ["-v"],
+
+        // Staging mutates the index but never working-tree content, and that
+        // content can only have been changed in ACT. So staging in SHIP grants
+        // no capability the gate has not already handed out, and without it
+        // SHIP blocks the step immediately preceding the commit it exists to
+        // authorize. `git commit -am` happens to work only because the commit
+        // itself is allowlisted and stages tracked files implicitly.
+        "add" if phase == Phase::Ship => true,
+
+        // Unstaging is the inverse of `add` and equally index-only. The
+        // `--staged` form is required: bare `git restore` overwrites working
+        // tree content from the index and would destroy uncommitted work.
+        "restore" if phase == Phase::Ship => args.first() == Some(&"--staged"),
+
+        _ => false,
+    }
 }
 
 fn cargo_command_allowed(args: &[&str], phase: Phase) -> bool {
@@ -125,6 +139,9 @@ fn cargo_command_allowed(args: &[&str], phase: Phase) -> bool {
 /// A `git` program token found at the head of a shell segment, resolved to the
 /// subcommand it will actually run.
 struct GitInvocation<'a> {
+    /// Index of the subcommand token within the source `words` slice, so
+    /// callers can recover the arguments that follow it.
+    index: usize,
     subcommand: &'a str,
 }
 
@@ -159,7 +176,10 @@ fn git_invocation<'a>(words: &[&'a str]) -> Option<GitInvocation<'a>> {
             i += 1;
             continue;
         }
-        return Some(GitInvocation { subcommand: word });
+        return Some(GitInvocation {
+            index: i,
+            subcommand: word,
+        });
     }
     None
 }
@@ -338,6 +358,88 @@ mod tests {
         assert!(!command_touches_commit_or_push("git"));
         assert!(!command_touches_commit_or_push("git -C /repo"));
         assert!(!command_touches_commit_or_push("git -C"));
+    }
+
+    #[test]
+    fn allows_staging_in_ship_phase() {
+        assert!(shell_command_allowed("git add -A", Phase::Ship));
+        assert!(shell_command_allowed("git add src/guard.rs", Phase::Ship));
+        assert!(shell_command_allowed("git add -p", Phase::Ship));
+        assert!(shell_command_allowed("git restore --staged .", Phase::Ship));
+    }
+
+    #[test]
+    fn denies_staging_outside_ship_phase() {
+        for phase in [Phase::Orient, Phase::Plan, Phase::Verify] {
+            assert!(!shell_command_allowed("git add -A", phase));
+            assert!(!shell_command_allowed("git restore --staged .", phase));
+        }
+        // ACT permits arbitrary mutation, so staging is trivially fine there.
+        assert!(shell_command_allowed("git add -A", Phase::Act));
+    }
+
+    #[test]
+    fn bare_restore_stays_blocked_so_it_cannot_discard_working_tree() {
+        assert!(!shell_command_allowed(
+            "git restore src/guard.rs",
+            Phase::Ship
+        ));
+        assert!(!shell_command_allowed("git restore .", Phase::Ship));
+    }
+
+    #[test]
+    fn argument_sensitive_git_verbs_stay_blocked_when_mutating() {
+        // Listing is allowed; the destructive forms are not.
+        assert!(shell_command_allowed("git branch", Phase::Ship));
+        assert!(shell_command_allowed(
+            "git branch --show-current",
+            Phase::Ship
+        ));
+        assert!(!shell_command_allowed("git branch -D main", Phase::Ship));
+        assert!(!shell_command_allowed("git branch -d main", Phase::Ship));
+
+        assert!(shell_command_allowed("git remote -v", Phase::Ship));
+        assert!(!shell_command_allowed(
+            "git remote add origin url",
+            Phase::Ship
+        ));
+        assert!(!shell_command_allowed(
+            "git remote remove origin",
+            Phase::Ship
+        ));
+    }
+
+    #[test]
+    fn read_only_git_resolves_subcommand_past_global_options() {
+        // Previously these were denied as mutations because the allowlist
+        // matched literal argument shapes rather than the resolved subcommand.
+        assert!(shell_command_allowed(
+            "git --no-pager log --oneline",
+            Phase::Ship
+        ));
+        assert!(shell_command_allowed(
+            "git -c color.ui=always status",
+            Phase::Verify
+        ));
+        assert!(shell_command_allowed(
+            "/usr/bin/git log --oneline",
+            Phase::Orient
+        ));
+        assert!(shell_command_allowed("git -C /repo status", Phase::Orient));
+    }
+
+    #[test]
+    fn other_mutating_git_subcommands_remain_blocked_in_ship_phase() {
+        for cmd in [
+            "git reset --hard",
+            "git checkout main",
+            "git stash",
+            "git rebase main",
+            "git merge main",
+            "git config user.name x",
+        ] {
+            assert!(!shell_command_allowed(cmd, Phase::Ship), "allowed: {cmd}");
+        }
     }
 }
 

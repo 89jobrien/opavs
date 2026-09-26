@@ -396,6 +396,90 @@ fn guard_allows_read_only_git_naming_push_in_verify_phase() {
 }
 
 #[test]
+fn guard_allows_staging_in_ship_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    opavs()
+        .current_dir(tmp.path())
+        .args(["phase", "set", "SHIP"])
+        .assert()
+        .success();
+
+    for command in ["git add -A", "git restore --staged src/main.rs"] {
+        let hook = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": tmp.path().display().to_string(),
+        });
+
+        opavs()
+            .args(["guard"])
+            .write_stdin(hook.to_string())
+            .assert()
+            .success()
+            .stdout("{\"continue\": true}\n");
+    }
+}
+
+#[test]
+fn guard_denies_staging_in_verify_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    opavs()
+        .current_dir(tmp.path())
+        .args(["phase", "set", "VERIFY"])
+        .assert()
+        .success();
+
+    let hook = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "git add -A"},
+        "cwd": tmp.path().display().to_string(),
+    });
+
+    opavs()
+        .args(["guard"])
+        .write_stdin(hook.to_string())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "File mutations are only allowed in ACT",
+        ));
+}
+
+#[test]
+fn guard_denies_destructive_git_in_ship_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    opavs()
+        .current_dir(tmp.path())
+        .args(["phase", "set", "SHIP"])
+        .assert()
+        .success();
+
+    for command in [
+        "git branch -D main",
+        "git reset --hard",
+        "git restore src/main.rs",
+    ] {
+        let hook = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": tmp.path().display().to_string(),
+        });
+
+        opavs()
+            .args(["guard"])
+            .write_stdin(hook.to_string())
+            .assert()
+            .success()
+            .stdout(predicates::str::contains(
+                "File mutations are only allowed in ACT",
+            ));
+    }
+}
+
+#[test]
 fn tasks_validate_reports_cycle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     opavs().arg("init").arg(tmp.path()).assert().success();
