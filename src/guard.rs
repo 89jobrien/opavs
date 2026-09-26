@@ -122,23 +122,58 @@ fn cargo_command_allowed(args: &[&str], phase: Phase) -> bool {
     }
 }
 
-/// Mirrors the guard's regex: matches `git ... commit` or `git ... push` as a
-/// whole word, optionally preceded by `-C <dir>`, anywhere in a compound command.
-pub fn command_touches_commit_or_push(cmd: &str) -> bool {
-    let re_words: Vec<&str> = cmd.split_whitespace().collect();
-    // find any "git" token followed later (same segment) by "commit" or "push"
-    for segment in cmd.split([';', '&', '|']) {
-        let words: Vec<&str> = segment.split_whitespace().collect();
-        if let Some(git_pos) = words.iter().position(|w| *w == "git")
-            && words[git_pos..]
-                .iter()
-                .any(|w| *w == "commit" || *w == "push")
-        {
-            return true;
-        }
+/// A `git` program token found at the head of a shell segment, resolved to the
+/// subcommand it will actually run.
+struct GitInvocation<'a> {
+    subcommand: &'a str,
+}
+
+/// Recognize a git program at the head of `words` and resolve its subcommand.
+///
+/// Tolerates a path prefix (`/usr/bin/git`) by comparing the final path
+/// component, exactly as `shell_segment_allowed` does — if the two classifiers
+/// disagree about what "a git command" is, a real `git push` can fall through
+/// to the ACT-only mutation rule and a user who obeys the resulting message is
+/// bounced into the phase that triggers the other one.
+///
+/// Skips git global options, and the argument to `-C`/`-c`, so
+/// `git -C /repo push` and `git --no-pager push` both resolve to `push`.
+///
+/// Returns `None` for a non-git program, or a bare `git` with no subcommand.
+fn git_invocation<'a>(words: &[&'a str]) -> Option<GitInvocation<'a>> {
+    let program = words.first()?;
+    if program.rsplit('/').next().unwrap_or(program) != "git" {
+        return None;
     }
-    let _ = re_words;
-    false
+
+    let mut i = 1;
+    while i < words.len() {
+        let word = words[i];
+        // `-C <dir>` and `-c <str>` consume the following word.
+        if matches!(word, "-C" | "-c") {
+            i += 2;
+            continue;
+        }
+        // Any other leading option is global; the subcommand follows it.
+        if word.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(GitInvocation { subcommand: word });
+    }
+    None
+}
+
+/// Whether any segment of `cmd` invokes `git commit` or `git push`.
+///
+/// Classification is by git *subcommand*, not by the presence of the words
+/// "commit" or "push" anywhere in the segment: `git log --grep push` is a
+/// read-only query and must not be gated as a push.
+pub fn command_touches_commit_or_push(cmd: &str) -> bool {
+    cmd.split([';', '&', '|']).any(|segment| {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        git_invocation(&words).is_some_and(|git| matches!(git.subcommand, "commit" | "push"))
+    })
 }
 
 #[cfg(test)]
@@ -264,6 +299,45 @@ mod tests {
     #[test]
     fn ignores_non_git_commands() {
         assert!(!command_touches_commit_or_push("echo commit push"));
+    }
+
+    #[test]
+    fn detects_path_prefixed_commit_and_push() {
+        assert!(command_touches_commit_or_push(
+            "/usr/bin/git push origin main"
+        ));
+        assert!(command_touches_commit_or_push(
+            "/opt/homebrew/bin/git commit -m x"
+        ));
+        assert!(command_touches_commit_or_push("./scripts/git push"));
+    }
+
+    #[test]
+    fn detects_commit_and_push_behind_global_options() {
+        assert!(command_touches_commit_or_push(
+            "git --no-pager push origin main"
+        ));
+        assert!(command_touches_commit_or_push(
+            "git -c core.pager=cat commit -m x"
+        ));
+    }
+
+    #[test]
+    fn ignores_read_only_git_whose_arguments_name_commit_or_push() {
+        assert!(!command_touches_commit_or_push(
+            "git log --grep push --oneline"
+        ));
+        assert!(!command_touches_commit_or_push(
+            "git show HEAD --stat commit"
+        ));
+        assert!(!command_touches_commit_or_push("git log push"));
+    }
+
+    #[test]
+    fn ignores_bare_git_with_no_subcommand() {
+        assert!(!command_touches_commit_or_push("git"));
+        assert!(!command_touches_commit_or_push("git -C /repo"));
+        assert!(!command_touches_commit_or_push("git -C"));
     }
 }
 

@@ -322,6 +322,80 @@ fn guard_allows_edit_in_act_phase() {
 }
 
 #[test]
+fn guard_denies_path_prefixed_push_in_act_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    opavs()
+        .current_dir(tmp.path())
+        .args(["phase", "set", "ACT"])
+        .assert()
+        .success();
+
+    let hook = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "/usr/bin/git push origin main"},
+        "cwd": tmp.path().display().to_string(),
+    });
+
+    opavs()
+        .args(["guard"])
+        .write_stdin(hook.to_string())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "git commit/push are only allowed in SHIP",
+        ));
+}
+
+#[test]
+fn guard_allows_path_prefixed_push_in_ship_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    opavs()
+        .current_dir(tmp.path())
+        .args(["phase", "set", "SHIP"])
+        .assert()
+        .success();
+
+    let hook = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "/usr/bin/git push origin main"},
+        "cwd": tmp.path().display().to_string(),
+    });
+
+    opavs()
+        .args(["guard"])
+        .write_stdin(hook.to_string())
+        .assert()
+        .success()
+        .stdout("{\"continue\": true}\n");
+}
+
+#[test]
+fn guard_allows_read_only_git_naming_push_in_verify_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    opavs()
+        .current_dir(tmp.path())
+        .args(["phase", "set", "VERIFY"])
+        .assert()
+        .success();
+
+    let hook = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "git log --grep push --oneline"},
+        "cwd": tmp.path().display().to_string(),
+    });
+
+    opavs()
+        .args(["guard"])
+        .write_stdin(hook.to_string())
+        .assert()
+        .success()
+        .stdout("{\"continue\": true}\n");
+}
+
+#[test]
 fn tasks_validate_reports_cycle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     opavs().arg("init").arg(tmp.path()).assert().success();
