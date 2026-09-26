@@ -480,6 +480,48 @@ fn guard_denies_destructive_git_in_ship_phase() {
 }
 
 #[test]
+fn guard_allows_self_upgrade_only_from_a_publishing_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+
+    // ACT is unrestricted at the command level; every other non-SHIP phase
+    // refuses it, since replacing the installed executable is a publish.
+    for (phase, allowed) in [
+        ("SHIP", true),
+        ("ACT", true),
+        ("VERIFY", false),
+        ("PLAN", false),
+        ("ORIENT", false),
+    ] {
+        opavs()
+            .current_dir(tmp.path())
+            .args(["phase", "set", phase])
+            .assert()
+            .success();
+
+        let hook = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "opavs upgrade"},
+            "cwd": tmp.path().display().to_string(),
+        });
+
+        let assertion = opavs()
+            .args(["guard"])
+            .write_stdin(hook.to_string())
+            .assert()
+            .success();
+
+        if allowed {
+            assertion.stdout("{\"continue\": true}\n");
+        } else {
+            assertion.stdout(predicates::str::contains(
+                "File mutations are only allowed in ACT",
+            ));
+        }
+    }
+}
+
+#[test]
 fn tasks_validate_reports_cycle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     opavs().arg("init").arg(tmp.path()).assert().success();
