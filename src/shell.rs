@@ -88,6 +88,13 @@ pub fn parse(line: &str) -> Vec<Command> {
                     quote = ch;
                     in_word = true;
                 }
+                '>' => {
+                    current.effects.file_write = true;
+                    // Flush so a redirect target stays its own word and cannot
+                    // be glued to the subcommand: `git log>out.txt` must still
+                    // read as `log`.
+                    end_word(&mut current, &mut word, &mut in_word);
+                }
                 ';' | '&' | '|' | '\n' => {
                     end_word(&mut current, &mut word, &mut in_word);
                     if !current.is_empty() {
@@ -150,6 +157,27 @@ mod tests {
             .map(|command| command.args)
             .collect();
         assert_eq!(words, vec![vec!["rg", "foo;bar", "src"]]);
+    }
+
+    #[test]
+    fn detects_unquoted_file_redirection_only() {
+        // The property that matters is that the line performs a file write, not
+        // that the first command does: `&>` is still split at the `&` here, so
+        // the write lands on a later command.
+        let writes = |cmd: &str| parse(cmd).iter().any(|c| c.effects.file_write);
+
+        for cmd in [
+            "rg foo > out.txt",
+            "rg foo >> out.txt",
+            "rg foo &> out.txt",
+            "rg foo >| out.txt",
+        ] {
+            assert!(writes(cmd), "{cmd}");
+        }
+        // A quoted metacharacter is literal text, not shell syntax.
+        for cmd in ["rg 'a > b' src", "rg \"a > b\" src"] {
+            assert!(!writes(cmd), "{cmd}");
+        }
     }
 }
 

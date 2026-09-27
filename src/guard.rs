@@ -133,18 +133,33 @@ fn permits(phase: Phase, op: Operation) -> bool {
     }
 }
 
+/// Constructs that write files or run an extra command. ACT is the only phase
+/// that permits them, and ACT already permits everything else too. Reading a file
+/// and duplicating a descriptor are not mutations: the gate governs changing the
+/// repository, and every Inspect command already reads the filesystem.
+fn effects_require_act(effects: shell::Effects) -> bool {
+    effects.substitution || effects.file_write
+}
+
+fn command_allowed(command: &shell::Command, phase: Phase) -> bool {
+    if effects_require_act(command.effects) && phase != Phase::Act {
+        return false;
+    }
+    match classify(&command.args) {
+        Some(operation) => permits(phase, operation),
+        // ACT permits commands the gate has no policy for; every other phase
+        // fails closed on an unrecognised program.
+        None => phase == Phase::Act,
+    }
+}
+
 /// Return whether every command in `cmd` performs an operation `phase` permits.
 ///
 /// Unknown programs fail closed, except in ACT, which is the working phase.
 pub fn shell_command_allowed(cmd: &str, phase: Phase) -> bool {
     shell::parse(cmd)
         .iter()
-        .all(|command| match classify(&command.args) {
-            Some(operation) => permits(phase, operation),
-            // ACT permits commands the gate has no policy for; every other phase
-            // fails closed on an unrecognised program.
-            None => phase == Phase::Act,
-        })
+        .all(|command| command_allowed(command, phase))
 }
 
 /// Classify one shell command into the operation it performs.
@@ -688,6 +703,13 @@ mod tests {
                 assert!(shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
             }
         }
+    }
+
+    #[test]
+    fn file_redirection_requires_act() {
+        assert!(!shell_command_allowed("rg foo > out.txt", Phase::Verify));
+        assert!(!shell_command_allowed("rg foo > out.txt", Phase::Ship));
+        assert!(shell_command_allowed("rg foo > out.txt", Phase::Act));
     }
 
     #[test]
