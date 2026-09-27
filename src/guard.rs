@@ -182,6 +182,7 @@ fn classify<S: AsRef<str>>(words: &[S]) -> Option<Operation> {
         // have no option that writes to a named path. `sort` and `uniq` are
         // handled separately below because they do have one.
         "head" | "tail" | "grep" | "wc" | "cut" | "tr" | "jq" => Some(Operation::Inspect),
+        "sort" => classify_sort(args),
         "pwd" | "ls" | "rg" | "fd" | "file" | "which" => Some(Operation::Inspect),
         // The project's own smoke driver builds a throwaway repo in a temp dir
         // and touches nothing in the working tree, so it stays available in every
@@ -225,6 +226,15 @@ fn classify_git<S: AsRef<str>>(words: &[S]) -> Option<Operation> {
         // Anything unrecognised fails closed rather than being assumed read-only.
         _ => return None,
     })
+}
+
+/// `sort` is read-only except for `-o`/`--output`, which writes a file without
+/// any shell redirection for the parser to see.
+fn classify_sort<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
+    let writes_output = args
+        .iter()
+        .any(|arg| arg.as_ref() == "-o" || arg.as_ref() == "--output");
+    (!writes_output).then_some(Operation::Inspect)
 }
 
 fn classify_cargo<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
@@ -724,6 +734,19 @@ mod tests {
             for phase in ALL_PHASES {
                 assert!(shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
             }
+        }
+    }
+
+    #[test]
+    fn sort_output_flag_is_refused_outside_act() {
+        assert!(shell_command_allowed("sort", Phase::Verify));
+        for cmd in [
+            "sort -o out.txt",
+            "sort --output out.txt",
+            "sort -o out.txt < in.txt",
+        ] {
+            assert!(!shell_command_allowed(cmd, Phase::Verify), "{cmd}");
+            assert!(shell_command_allowed(cmd, Phase::Act), "{cmd}");
         }
     }
 
