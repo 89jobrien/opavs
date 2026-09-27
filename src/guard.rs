@@ -183,6 +183,7 @@ fn classify<S: AsRef<str>>(words: &[S]) -> Option<Operation> {
         // handled separately below because they do have one.
         "head" | "tail" | "grep" | "wc" | "cut" | "tr" | "jq" => Some(Operation::Inspect),
         "sort" => classify_sort(args),
+        "uniq" => classify_uniq(args),
         "pwd" | "ls" | "rg" | "fd" | "file" | "which" => Some(Operation::Inspect),
         // The project's own smoke driver builds a throwaway repo in a temp dir
         // and touches nothing in the working tree, so it stays available in every
@@ -235,6 +236,34 @@ fn classify_sort<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
         .iter()
         .any(|arg| arg.as_ref() == "-o" || arg.as_ref() == "--output");
     (!writes_output).then_some(Operation::Inspect)
+}
+
+/// `uniq sorted.txt` with exactly one operand rewrites that file in place, which
+/// is a mutation disguised as inspection. Two or more operands read the first and
+/// write stdout, and no operands at all reads stdin.
+///
+/// The value-taking flags must not be mistaken for operands, so `-f 2 file` is one
+/// operand rather than three.
+fn classify_uniq<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
+    const VALUE_FLAGS: [&str; 6] = ["-f", "-s", "-w", "--skip-fields", "--skip-chars", "--chars"];
+    let mut operands = 0usize;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_ref();
+        if VALUE_FLAGS.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            operands += 1;
+        }
+        i += 1;
+    }
+    Some(if operands == 1 {
+        Operation::Mutate
+    } else {
+        Operation::Inspect
+    })
 }
 
 fn classify_cargo<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
@@ -734,6 +763,20 @@ mod tests {
             for phase in ALL_PHASES {
                 assert!(shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
             }
+        }
+    }
+
+    #[test]
+    fn uniq_single_operand_rewrites_in_place_and_is_refused() {
+        // No operand reads stdin; two operands read the first and write stdout.
+        assert!(shell_command_allowed("uniq", Phase::Verify));
+        assert!(shell_command_allowed("uniq a b", Phase::Verify));
+        for cmd in [
+            "uniq sorted.txt",
+            "uniq -i sorted.txt",
+            "uniq -f 2 sorted.txt",
+        ] {
+            assert!(!shell_command_allowed(cmd, Phase::Verify), "{cmd}");
         }
     }
 
