@@ -102,6 +102,21 @@ pub fn parse(line: &str) -> Vec<Command> {
                     current.effects.substitution = true;
                     end_word(&mut current, &mut word, &mut in_word);
                 }
+                '<' => {
+                    // `<(cmd)` runs a command to produce a path, so it is a
+                    // substitution rather than a read.
+                    if chars.peek() == Some(&'(') {
+                        current.effects.substitution = true;
+                    } else {
+                        current.effects.file_read = true;
+                    }
+                    end_word(&mut current, &mut word, &mut in_word);
+                }
+                // Must precede the plain `>` arm, which is the fallback.
+                '>' if chars.peek() == Some(&'(') => {
+                    current.effects.substitution = true;
+                    end_word(&mut current, &mut word, &mut in_word);
+                }
                 '&' if chars.peek() == Some(&'>') => {
                     // `&> file` redirects both streams to a file.
                     current.effects.file_write = true;
@@ -185,6 +200,17 @@ mod tests {
             .map(|command| command.args)
             .collect();
         assert_eq!(words, vec![vec!["rg", "foo;bar", "src"]]);
+    }
+
+    #[test]
+    fn distinguishes_file_read_from_process_substitution() {
+        let command = parse("sort < in.txt").remove(0);
+        assert!(command.effects.file_read);
+        assert!(!command.effects.substitution);
+
+        let command = parse("diff <(a) <(b)").remove(0);
+        assert!(command.effects.substitution);
+        assert!(!command.effects.file_read);
     }
 
     #[test]

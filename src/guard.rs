@@ -706,6 +706,13 @@ mod tests {
     }
 
     #[test]
+    fn file_reads_are_permitted_outside_act() {
+        // `rg` is Inspect in every phase, so this isolates the read: were
+        // `file_read` ever added to the effects precondition, this would fail.
+        assert!(shell_command_allowed("rg pattern < in.txt", Phase::Verify));
+    }
+
+    #[test]
     fn descriptor_duplication_is_permitted_in_verification() {
         assert!(shell_command_allowed("cargo test 2>&1", Phase::Verify));
         // `git status` is Inspect in every phase, so anything refusing it here
