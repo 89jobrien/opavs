@@ -20,7 +20,7 @@ is what this tool is _for_.
 
 Install from a source checkout, then install the agent integrations you use:
 
-```
+```text
 git clone https://github.com/89jobrien/opavs.git
 cargo install --path opavs
 opavs plugin install all
@@ -30,7 +30,7 @@ opavs plugin install all
 
 ### Phase discipline (core)
 
-```
+```text
 opavs init [repo_root]     # scaffold OPAVS state and update instruction files
 opavs phase get            # print current phase (defaults to ORIENT)
 opavs phase set <PHASE>    # ORIENT | PLAN | ACT | VERIFY | SHIP
@@ -43,8 +43,29 @@ opavs plugin install <target> [--home /path/to/home]
                             # install OPAVS integration for one target:
                             # claude | codex | gemini | opencode | all
 
+opavs doctor [repo_root] [--home /path/to/home]
+                            # diagnose repository and client integration state
+
 opavs upgrade               # download and install the newest GitHub release
 ```
+
+### Doctor
+
+`opavs doctor` performs a read-only diagnosis of the repository scaffold, task
+graph, ephemeral phase state, and supported client integrations. Its filesystem-
+and Git-backed adapter reads configuration and uses read-only Git inspection to
+check whether phase state is ignored.
+
+Each check is reported as `Pass`, `Warning`, or `Error`. A warning identifies a
+condition worth correcting that does not by itself make enforcement untrustworthy;
+an error means OPAVS should not be relied on until it is repaired. Printed repair
+steps are advisory: doctor does not apply them or otherwise mutate inspected files.
+
+The command exits nonzero after rendering any `Error` finding. Setup failures,
+such as an unavailable home directory, and inspection failures from unreadable or
+non-UTF-8 artifacts or a failed Git process also exit nonzero and may prevent a
+report from being rendered. Malformed inspected content is normally reported as
+an `Error` finding with an advisory repair.
 
 `opavs upgrade` checks the latest `89jobrien/opavs` GitHub Release, downloads
 the archive matching the current platform, and replaces the running executable.
@@ -76,6 +97,42 @@ treated as additional context and are never executed as shell commands.
 
 Gemini retains its extension and context integration but does not receive the
 phase slash commands. Re-running plugin installation updates changed artifacts;
+`opavs uninstall` reverses it.
+
+### Uninstall
+
+`opavs uninstall` removes what OPAVS installed, and is driven by the same artifact
+list `opavs plugin install` uses, so the two cannot drift.
+
+```bash
+opavs uninstall --dry-run                 # report everything, change nothing
+opavs uninstall                            # remove every client integration
+opavs uninstall --target claude           # remove one integration
+opavs uninstall --purge-repo --repo .     # also strip this repo's scaffolding
+```
+
+Two rules keep it from destroying anything it did not create:
+
+- **Owned** artifacts — the skill, phase commands, hook manifest, plugin
+  package — are deleted only when their contents still match what OPAVS wrote.
+  A file you have edited is reported and left in place.
+- **Shared** configuration is never deleted. The OPAVS entry is excised from
+  `~/.codex/hooks.json`, `~/.gemini/extensions/extension-enablement.json`, and
+  `~/.config/opencode/opencode.json`, and everything around it is left as it was.
+  A file OPAVS never touched comes out byte-identical.
+
+`--purge-repo` requires an explicit `--repo` path rather than resolving one from
+the working directory, because it deletes the task graph. It removes
+`.ctx/opavs/`, `OPAVS.md`, the appended workflow block in `AGENTS.md`/`CLAUDE.md`,
+and the `.gitignore` line `init` added. Memory-bank files survive if you have
+written into them, and are removed only while they still hold the generated
+template.
+
+Uninstall is gated to the `SHIP` phase, since it deletes files and takes work off
+the machine. `--dry-run` only reports, so it stays available in every phase.
+
+The command removes OPAVS's artifacts but not the executable itself; remove that
+with `cargo install --uninstall --name opavs`.
 when nothing changed, the target reports that it is already up to date.
 
 `opavs guard` is meant to be wired as a `PreToolUse` hook. Claude and Codex use
@@ -87,6 +144,12 @@ OPAVS phase/task queries, read-only Git and discovery commands, Cargo metadata,
 and phase-appropriate verification or handoff commands. Unknown commands are
 denied.
 
+Within that allowlist, reading a file (`< file`) and duplicating a file descriptor
+(`2>&1`) are permitted in every phase: neither mutates anything. Writing to a path
+(`> file`, `>> file`, `&> file`) and command substitution (`$(...)`, backticks, and
+the process substitutions `<(...)` and `>(...)`) are permitted only in `ACT`, as is
+`tee`, which writes files by design.
+
 **Fail-open by design outside opavs-enabled repos.** Resolution walks upward
 from the target directory but stops at the nearest Git repository or worktree
 boundary. If no `.ctx/opavs/tasks.yaml` is found before that boundary (or the
@@ -97,7 +160,7 @@ not initialized will silently allow everything. Verify its own
 
 ### Task graph (optional companion)
 
-```
+```text
 opavs tasks list                      # list all tasks with status
 opavs tasks runnable                  # tasks not done, with all deps done
 opavs tasks validate                  # unknown-dependency and cycle detection
@@ -110,14 +173,19 @@ opavs tasks import <path>             # merge an external GODMODE.tasks.yaml
 ## Architecture
 
 Hexagonal: `domain` holds `Phase`/`Task` types, the `PhaseStore`/`TaskStore`
-ports, and pure task-graph logic with zero I/O. `adapters` implements those
-ports against the filesystem; `guard` owns pure policy decisions and shell
-classification. `init`, `plugin`, and `upgrade` are filesystem/network-facing
-adapters. `main.rs` is the composition root wiring clap subcommands to them.
+ports, and pure task-graph logic with zero I/O. `doctor` is the mutation-free
+diagnosis and repair-planning service. `adapters` implements state ports against
+the filesystem and backs doctor with filesystem reads plus read-only Git ignore
+queries. `guard` owns pure policy decisions and shell classification. `init`,
+`plugin`, and `upgrade` are filesystem/network-facing adapters, while plugin
+installation, doctor, and `uninstall` all read the same client-artifact
+expectations from `plugin`, so install, diagnosis, and removal cannot disagree
+about what OPAVS owns. `main.rs` is the composition root wiring clap subcommands
+to them.
 
 ## Build
 
-```
+```text
 cargo check
 cargo clippy --all-targets
 cargo test

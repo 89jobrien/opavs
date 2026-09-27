@@ -1,3 +1,5 @@
+//! Loads and merges external GODMODE task graphs into OPAVS task state.
+
 use crate::domain::TaskGraph;
 use anyhow::Result;
 use std::path::Path;

@@ -1,4 +1,7 @@
+//! Pure policy decisions for phase-gated tool and shell-command execution.
+
 use crate::domain::Phase;
+use crate::shell;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -38,103 +41,355 @@ pub fn decide(
     }
 }
 
-/// Return whether a shell command is safe to run in a phase that does not
-/// permit arbitrary file mutations. Unknown commands fail closed.
-pub fn shell_command_allowed(cmd: &str, phase: Phase) -> bool {
+/// The side effect a command has, from the gate's point of view.
+///
+/// This is the vocabulary the phase policy below is written in. It exists
+/// because policy used to be implicit in three separate places — a blanket
+/// short-circuit for ACT, one read-only allowlist shared by every other phase,
+/// and ad-hoc phase checks inside each command's matcher. Any capability a
+/// phase needed but nobody had written down was simply absent, which is how
+/// SHIP ended up unable to stage, run `gh`, or upgrade the tool itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    /// Read-only inspection of the repository, working tree, or manifest graph.
+    Inspect,
+    /// Runs the project's checks without changing the working tree.
+    Verify,
+    /// Edits working-tree files.
+    Mutate,
+    /// Edits the git index only, leaving working-tree content untouched.
+    Stage,
+    /// Moves work off the machine: commit, push, PR, release, self-upgrade.
+    Publish,
+    /// Reads or writes the current phase.
+    PhaseState,
+    /// Edits the task graph.
+    TaskState,
+    /// Records an end-of-session handoff.
+    Handoff,
+}
+
+/// Every operation, in a fixed order so the policy test can state each phase's
+/// permitted set as a plain list. Test-only: production code asks `permits` about
+/// one operation at a time, but the test needs the full set to prove the table has
+/// no operation silently falling through to a default arm.
+#[cfg(test)]
+const ALL_OPERATIONS: [Operation; 8] = [
+    Operation::Inspect,
+    Operation::Verify,
+    Operation::Mutate,
+    Operation::Stage,
+    Operation::Publish,
+    Operation::PhaseState,
+    Operation::TaskState,
+    Operation::Handoff,
+];
+
+/// Which operations each phase permits.
+///
+/// This table is the single declaration of phase policy. `shell_command_allowed`
+/// classifies a command into an `Operation` and asks this function, so granting a
+/// capability is a one-line change here rather than a discovery that the gate is
+/// missing something.
+///
+/// TODO(verification-policy): load validated per-repository gates so non-Rust
+/// projects can declare their own Verify commands instead of relying on cargo.
+fn permits(phase: Phase, op: Operation) -> bool {
+    use Operation::*;
+
+    // ACT is the working phase and imposes no command-level restriction at all.
+    //
+    // The one thing refused in ACT is commit and push, and that is enforced by
+    // the dedicated classifier in `command_touches_commit_or_push` before this
+    // table is consulted -- a stricter rule layered on top, not an operation the
+    // table withholds. `permits` must not claim otherwise, or the two mechanisms
+    // disagree and the looser one wins: an operation refused only here reaches
+    // `decide` as a generic `BashMutation`, which ACT allows.
     if phase == Phase::Act {
         return true;
     }
 
-    cmd.split([';', '&', '|'])
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .all(|segment| shell_segment_allowed(segment, phase))
+    match op {
+        // Reading things, and reading or setting the phase itself, is what every
+        // phase is for.
+        Inspect | PhaseState => true,
+        // Planning is when the task graph is edited.
+        TaskState => phase == Phase::Plan,
+        // Verification is the purpose of VERIFY, and must stay available in SHIP
+        // so the gates can be re-run immediately before publishing.
+        Verify => matches!(phase, Phase::Verify | Phase::Ship),
+        // Staging touches the index but never working-tree content, and that
+        // content can only have been changed in ACT. So allowing it in SHIP grants
+        // no capability the gate has not already issued, and without it SHIP blocks
+        // the step immediately preceding the commit it exists to authorize.
+        Stage => phase == Phase::Ship,
+        // Publishing is SHIP, and only SHIP. This covers publish operations that
+        // are not commit or push -- currently `opavs upgrade`, which replaces the
+        // installed executable and so previously could not be run from any phase.
+        Publish => phase == Phase::Ship,
+        Handoff => phase == Phase::Ship,
+        // No other phase edits the working tree.
+        Mutate => false,
+    }
 }
 
-fn shell_segment_allowed(segment: &str, phase: Phase) -> bool {
-    if segment.contains(['>', '<', '`']) || segment.contains("$(") {
+/// Constructs that write files or run an extra command. ACT is the only phase
+/// that permits them, and ACT already permits everything else too. Reading a file
+/// and duplicating a descriptor are not mutations: the gate governs changing the
+/// repository, and every Inspect command already reads the filesystem.
+fn effects_require_act(effects: shell::Effects) -> bool {
+    effects.substitution || effects.file_write
+}
+
+fn command_allowed(command: &shell::Command, phase: Phase) -> bool {
+    if effects_require_act(command.effects) && phase != Phase::Act {
         return false;
     }
+    match classify(&command.args) {
+        Some(operation) => permits(phase, operation),
+        // ACT permits commands the gate has no policy for; every other phase
+        // fails closed on an unrecognised program.
+        None => phase == Phase::Act,
+    }
+}
 
-    let words: Vec<&str> = segment.split_whitespace().collect();
-    let Some(program) = words.first().copied() else {
-        return true;
-    };
+/// Return whether every command in `cmd` performs an operation `phase` permits.
+///
+/// Unknown programs fail closed, except in ACT, which is the working phase.
+pub fn shell_command_allowed(cmd: &str, phase: Phase) -> bool {
+    shell::parse(cmd)
+        .iter()
+        .all(|command| command_allowed(command, phase))
+}
+
+/// Classify one shell command into the operation it performs.
+///
+/// Purely a function of the command: nothing here consults the phase, so the
+/// per-phase policy lives in exactly one place (`permits`). `None` means the gate
+/// has no policy for this program, which callers treat as fail-closed.
+fn classify<S: AsRef<str>>(words: &[S]) -> Option<Operation> {
+    let program = words.first()?.as_ref();
     let program = program.rsplit('/').next().unwrap_or(program);
+    let args = &words[1..];
 
     match program {
-        "opavs" => opavs_command_allowed(&words[1..], phase),
-        "git" => git_command_allowed(&words[1..]),
-        "cargo" => cargo_command_allowed(&words[1..], phase),
-        "pwd" | "ls" | "rg" | "fd" | "file" | "which" => true,
-        "nu" => words
-            .get(1)
-            .is_some_and(|path| path.ends_with(".claude/skills/run-opavs/smoke.nu")),
-        "hj" | "godmode" if phase == Phase::Ship => {
-            words.get(1).is_some_and(|command| *command == "handoff")
+        "git" => classify_git(words),
+        "cargo" => classify_cargo(args),
+        "opavs" => classify_opavs(args),
+        "hj" | "godmode" => (args.first()?.as_ref() == "handoff").then_some(Operation::Handoff),
+        // Reading the filesystem and locating binaries changes nothing.
+        // Read-only filters, each checked against its man page and confirmed to
+        // have no option that writes to a named path. `sort` and `uniq` are
+        // handled separately below because they do have one.
+        "head" | "tail" | "grep" | "wc" | "cut" | "tr" | "jq" => Some(Operation::Inspect),
+        "sort" => classify_sort(args),
+        "uniq" => classify_uniq(args),
+        "pwd" | "ls" | "rg" | "fd" | "file" | "which" => Some(Operation::Inspect),
+        // The project's own smoke driver builds a throwaway repo in a temp dir
+        // and touches nothing in the working tree, so it stays available in every
+        // phase as it was before this table existed.
+        "nu" => args
+            .first()
+            .is_some_and(|path| path.as_ref().ends_with(".claude/skills/run-opavs/smoke.nu"))
+            .then_some(Operation::Inspect),
+        _ => None,
+    }
+}
+
+fn classify_git<S: AsRef<str>>(words: &[S]) -> Option<Operation> {
+    let index = git_invocation(words)?;
+    let args = &words[index + 1..];
+    let one_arg = |expected: &str| args.len() == 1 && args[0].as_ref() == expected;
+
+    Some(match words[index].as_ref() {
+        "status" | "diff" | "log" | "show" | "rev-parse" => Operation::Inspect,
+
+        // Listing is read-only, but the mutating forms of these two verbs are
+        // not, so they stay argument-sensitive: `git branch -d` deletes a branch
+        // and `git remote add` rewrites config.
+        "branch" if args.is_empty() || one_arg("--show-current") => Operation::Inspect,
+        "remote" if one_arg("-v") => Operation::Inspect,
+
+        "add" => Operation::Stage,
+        // The `--staged` form only rewrites the index. Bare `git restore`
+        // overwrites working-tree content from the index, which is why it falls
+        // through to Mutate below.
+        "restore" if args.first().is_some_and(|a| a.as_ref() == "--staged") => Operation::Stage,
+
+        "commit" | "push" => Operation::Publish,
+
+        // Ref-, config-, and working-tree-rewriting verbs.
+        "restore" | "branch" | "remote" | "reset" | "checkout" | "switch" | "stash" | "rebase"
+        | "merge" | "cherry-pick" | "revert" | "config" | "clean" | "apply" | "am" | "tag" => {
+            Operation::Mutate
         }
-        _ => false,
-    }
+
+        // Anything unrecognised fails closed rather than being assumed read-only.
+        _ => return None,
+    })
 }
 
-fn opavs_command_allowed(args: &[&str], phase: Phase) -> bool {
-    match args {
-        ["phase", "get"] | ["phase", "set", _] => true,
-        ["tasks", "list"] | ["tasks", "runnable"] | ["tasks", "validate"] => true,
-        ["tasks", "set-status", ..] | ["tasks", "import", ..] => phase == Phase::Plan,
-        _ => false,
-    }
+/// `sort` is read-only except for `-o`/`--output`, which writes a file without
+/// any shell redirection for the parser to see.
+fn classify_sort<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
+    let writes_output = args
+        .iter()
+        .any(|arg| arg.as_ref() == "-o" || arg.as_ref() == "--output");
+    (!writes_output).then_some(Operation::Inspect)
 }
 
-fn git_command_allowed(args: &[&str]) -> bool {
-    let args = if matches!(args.first(), Some(&"-C")) && args.len() >= 3 {
-        &args[2..]
+/// `uniq sorted.txt` with exactly one operand rewrites that file in place, which
+/// is a mutation disguised as inspection. Two or more operands read the first and
+/// write stdout, and no operands at all reads stdin.
+///
+/// The value-taking flags must not be mistaken for operands, so `-f 2 file` is one
+/// operand rather than three.
+fn classify_uniq<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
+    const VALUE_FLAGS: [&str; 6] = ["-f", "-s", "-w", "--skip-fields", "--skip-chars", "--chars"];
+    let mut operands = 0usize;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_ref();
+        if VALUE_FLAGS.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            operands += 1;
+        }
+        i += 1;
+    }
+    Some(if operands == 1 {
+        Operation::Mutate
     } else {
-        args
-    };
-
-    matches!(
-        args,
-        ["status", ..]
-            | ["diff", ..]
-            | ["log", ..]
-            | ["show", ..]
-            | ["rev-parse", ..]
-            | ["branch"]
-            | ["branch", "--show-current"]
-            | ["remote", "-v"]
-    )
+        Operation::Inspect
+    })
 }
 
-fn cargo_command_allowed(args: &[&str], phase: Phase) -> bool {
-    if phase != Phase::Verify && phase != Phase::Ship {
-        return matches!(args, ["metadata", ..]);
-    }
-
-    match args {
-        ["check", ..] | ["clippy", ..] | ["test", ..] | ["nextest", "run", ..] => true,
-        ["fmt", rest @ ..] => rest.contains(&"--check"),
-        _ => false,
-    }
+fn classify_cargo<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
+    Some(match args.first()?.as_ref() {
+        // Reading the manifest graph changes nothing.
+        "metadata" => Operation::Inspect,
+        "check" | "clippy" | "test" => Operation::Verify,
+        "nextest" if args.get(1).is_some_and(|a| a.as_ref() == "run") => Operation::Verify,
+        // `cargo fmt --check` only reports; without `--check` it rewrites files.
+        "fmt" if args.iter().any(|a| a.as_ref() == "--check") => Operation::Verify,
+        "fmt" => Operation::Mutate,
+        // `build`, `doc`, `install` and friends stay unclassified: ACT permits
+        // them, and no other phase has a reason to.
+        _ => return None,
+    })
 }
 
-/// Mirrors the guard's regex: matches `git ... commit` or `git ... push` as a
-/// whole word, optionally preceded by `-C <dir>`, anywhere in a compound command.
-pub fn command_touches_commit_or_push(cmd: &str) -> bool {
-    let re_words: Vec<&str> = cmd.split_whitespace().collect();
-    // find any "git" token followed later (same segment) by "commit" or "push"
-    for segment in cmd.split([';', '&', '|']) {
-        let words: Vec<&str> = segment.split_whitespace().collect();
-        if let Some(git_pos) = words.iter().position(|w| *w == "git")
-            && words[git_pos..]
-                .iter()
-                .any(|w| *w == "commit" || *w == "push")
-        {
-            return true;
+fn classify_opavs<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
+    // clap resolves --help/-h/--version/-V before dispatching to any
+    // subcommand, wherever the flag appears. So `opavs init --help` prints usage
+    // without scaffolding anything and `opavs upgrade --version` reports a
+    // version without downloading: all of these are read-only no-ops.
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_ref(), "--help" | "-h" | "--version" | "-V"))
+    {
+        return Some(Operation::Inspect);
+    }
+
+    let second = args.get(1).map(AsRef::as_ref);
+    Some(match (args.first()?.as_ref(), second) {
+        ("phase", Some("get" | "set")) => Operation::PhaseState,
+        ("tasks", Some("list" | "runnable" | "validate")) => Operation::PhaseState,
+        ("tasks", Some("set-status" | "import")) => Operation::TaskState,
+
+        // Diagnosing without applying repairs, and turning hook JSON on stdin
+        // into a verdict, are both read-only -- and VERIFY is exactly the phase
+        // you reach for them in, so refusing them there was perverse.
+        ("doctor", _) | ("guard", _) => Operation::Inspect,
+
+        // `init` scaffolds the repository; `plugin install` writes into the
+        // user's home directory.
+        ("init", _) | ("plugin", _) => Operation::Mutate,
+
+        // Replacing the installed executable is a publish action, and SHIP is
+        // the only phase that permits one.
+        ("upgrade", _) => Operation::Publish,
+
+        // Removal takes work off the machine and deletes files, so it is gated
+        // like publishing. `--dry-run` only reports, which is why it is matched
+        // ahead of the general arm -- and it is searched across every argument,
+        // because `--target <name>` may precede it.
+        ("uninstall", Some(_)) if args.iter().any(|arg| arg.as_ref() == "--dry-run") => {
+            Operation::Inspect
         }
+        ("uninstall", _) => Operation::Publish,
+
+        _ => return None,
+    })
+}
+
+/// Recognize a git program at the head of `words` and return the index of the
+/// subcommand it will run.
+///
+/// Tolerates a path prefix (`/usr/bin/git`) by comparing the final path
+/// component, exactly as `classify` does — if the two classifiers disagree about
+/// what "a git command" is, a real `git push` can fall through to the ACT-only
+/// mutation rule and a user who obeys the resulting message is bounced into the
+/// phase that triggers the other one.
+///
+/// Skips git global options, and the argument to `-C`/`-c`, so
+/// `git -C /repo push` and `git --no-pager push` both resolve to `push`.
+///
+/// Returns `None` for a non-git program, or a bare `git` with no subcommand.
+fn git_invocation<S: AsRef<str>>(words: &[S]) -> Option<usize> {
+    let program = words.first()?.as_ref();
+    if program.rsplit('/').next().unwrap_or(program) != "git" {
+        return None;
     }
-    let _ = re_words;
-    false
+
+    let mut i = 1;
+    while i < words.len() {
+        let word = words[i].as_ref();
+        // `-C <dir>` and `-c <str>` consume the following word.
+        if matches!(word, "-C" | "-c") {
+            i += 2;
+            continue;
+        }
+        // Any other leading option is global; the subcommand follows it.
+        if word.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// The path argument to a `git -C <path>` flag, if any command in `line` is a
+/// git invocation carrying one.
+///
+/// Segment-aware by construction: a `-C` belonging to a non-git command is not a
+/// directory flag. `rg -C 3 pattern` is grep's context flag, and treating it as
+/// git's would hand the resolver a repo root of `3`.
+///
+/// The flag is searched among the global options preceding the subcommand, which
+/// is where `git_invocation` leaves it after skipping `-C` and its value.
+pub fn git_dash_c_target(line: &str) -> Option<String> {
+    shell::parse(line).iter().find_map(|command| {
+        let index = git_invocation(&command.args)?;
+        let globals = &command.args[1..index];
+        let position = globals.iter().position(|arg| arg == "-C")?;
+        globals.get(position + 1).cloned()
+    })
+}
+
+/// Whether any command in `cmd` invokes `git commit` or `git push`.
+///
+/// Classification is by git *subcommand*, not by the presence of the words
+/// "commit" or "push" anywhere in the command: `git log --grep push` is a
+/// read-only query and must not be gated as a push.
+pub fn command_touches_commit_or_push(cmd: &str) -> bool {
+    shell::parse(cmd).iter().any(|command| {
+        git_invocation(&command.args)
+            .is_some_and(|index| matches!(command.args[index].as_str(), "commit" | "push"))
+    })
 }
 
 #[cfg(test)]
@@ -260,6 +515,430 @@ mod tests {
     #[test]
     fn ignores_non_git_commands() {
         assert!(!command_touches_commit_or_push("echo commit push"));
+    }
+
+    #[test]
+    fn detects_path_prefixed_commit_and_push() {
+        assert!(command_touches_commit_or_push(
+            "/usr/bin/git push origin main"
+        ));
+        assert!(command_touches_commit_or_push(
+            "/opt/homebrew/bin/git commit -m x"
+        ));
+        assert!(command_touches_commit_or_push("./scripts/git push"));
+    }
+
+    #[test]
+    fn detects_commit_and_push_behind_global_options() {
+        assert!(command_touches_commit_or_push(
+            "git --no-pager push origin main"
+        ));
+        assert!(command_touches_commit_or_push(
+            "git -c core.pager=cat commit -m x"
+        ));
+    }
+
+    #[test]
+    fn ignores_read_only_git_whose_arguments_name_commit_or_push() {
+        assert!(!command_touches_commit_or_push(
+            "git log --grep push --oneline"
+        ));
+        assert!(!command_touches_commit_or_push(
+            "git show HEAD --stat commit"
+        ));
+        assert!(!command_touches_commit_or_push("git log push"));
+    }
+
+    #[test]
+    fn ignores_bare_git_with_no_subcommand() {
+        assert!(!command_touches_commit_or_push("git"));
+        assert!(!command_touches_commit_or_push("git -C /repo"));
+        assert!(!command_touches_commit_or_push("git -C"));
+    }
+
+    #[test]
+    fn allows_staging_in_ship_phase() {
+        assert!(shell_command_allowed("git add -A", Phase::Ship));
+        assert!(shell_command_allowed("git add src/guard.rs", Phase::Ship));
+        assert!(shell_command_allowed("git add -p", Phase::Ship));
+        assert!(shell_command_allowed("git restore --staged .", Phase::Ship));
+    }
+
+    #[test]
+    fn denies_staging_outside_ship_phase() {
+        for phase in [Phase::Orient, Phase::Plan, Phase::Verify] {
+            assert!(!shell_command_allowed("git add -A", phase));
+            assert!(!shell_command_allowed("git restore --staged .", phase));
+        }
+        // ACT permits arbitrary mutation, so staging is trivially fine there.
+        assert!(shell_command_allowed("git add -A", Phase::Act));
+    }
+
+    #[test]
+    fn bare_restore_stays_blocked_so_it_cannot_discard_working_tree() {
+        assert!(!shell_command_allowed(
+            "git restore src/guard.rs",
+            Phase::Ship
+        ));
+        assert!(!shell_command_allowed("git restore .", Phase::Ship));
+    }
+
+    #[test]
+    fn argument_sensitive_git_verbs_stay_blocked_when_mutating() {
+        // Listing is allowed; the destructive forms are not.
+        assert!(shell_command_allowed("git branch", Phase::Ship));
+        assert!(shell_command_allowed(
+            "git branch --show-current",
+            Phase::Ship
+        ));
+        assert!(!shell_command_allowed("git branch -D main", Phase::Ship));
+        assert!(!shell_command_allowed("git branch -d main", Phase::Ship));
+
+        assert!(shell_command_allowed("git remote -v", Phase::Ship));
+        assert!(!shell_command_allowed(
+            "git remote add origin url",
+            Phase::Ship
+        ));
+        assert!(!shell_command_allowed(
+            "git remote remove origin",
+            Phase::Ship
+        ));
+    }
+
+    #[test]
+    fn read_only_git_resolves_subcommand_past_global_options() {
+        // Previously these were denied as mutations because the allowlist
+        // matched literal argument shapes rather than the resolved subcommand.
+        assert!(shell_command_allowed(
+            "git --no-pager log --oneline",
+            Phase::Ship
+        ));
+        assert!(shell_command_allowed(
+            "git -c color.ui=always status",
+            Phase::Verify
+        ));
+        assert!(shell_command_allowed(
+            "/usr/bin/git log --oneline",
+            Phase::Orient
+        ));
+        assert!(shell_command_allowed("git -C /repo status", Phase::Orient));
+    }
+
+    #[test]
+    fn other_mutating_git_subcommands_remain_blocked_in_ship_phase() {
+        for cmd in [
+            "git reset --hard",
+            "git checkout main",
+            "git stash",
+            "git rebase main",
+            "git merge main",
+            "git config user.name x",
+        ] {
+            assert!(!shell_command_allowed(cmd, Phase::Ship), "allowed: {cmd}");
+        }
+    }
+
+    // --- phase policy ---
+
+    /// The whole point of the `Operation` table: each phase's permitted set is
+    /// stated here as data, so a change to policy shows up as a failing assertion
+    /// naming the phase and the operation, rather than as a capability someone
+    /// discovers missing while trying to ship.
+    #[test]
+    fn each_phase_permits_exactly_its_declared_operations() {
+        use Operation::*;
+
+        let permitted = |phase| -> Vec<Operation> {
+            ALL_OPERATIONS
+                .into_iter()
+                .filter(|op| permits(phase, *op))
+                .collect()
+        };
+
+        assert_eq!(permitted(Phase::Orient), vec![Inspect, PhaseState]);
+        assert_eq!(permitted(Phase::Plan), vec![Inspect, PhaseState, TaskState]);
+        assert_eq!(permitted(Phase::Act), ALL_OPERATIONS.to_vec());
+        assert_eq!(permitted(Phase::Verify), vec![Inspect, Verify, PhaseState]);
+        assert_eq!(
+            permitted(Phase::Ship),
+            vec![Inspect, Verify, Stage, Publish, PhaseState, Handoff]
+        );
+    }
+
+    #[test]
+    fn commands_classify_into_declared_operations() {
+        let op = |cmd: &str| -> Option<Operation> {
+            let words: Vec<&str> = cmd.split_whitespace().collect();
+            classify(&words)
+        };
+
+        assert_eq!(op("git status"), Some(Operation::Inspect));
+        assert_eq!(op("git log --oneline"), Some(Operation::Inspect));
+        assert_eq!(op("git add -A"), Some(Operation::Stage));
+        assert_eq!(op("git restore --staged ."), Some(Operation::Stage));
+        assert_eq!(op("git commit -m x"), Some(Operation::Publish));
+        assert_eq!(op("/usr/bin/git push"), Some(Operation::Publish));
+        assert_eq!(op("git branch -D main"), Some(Operation::Mutate));
+        assert_eq!(op("git restore ."), Some(Operation::Mutate));
+        assert_eq!(op("cargo test"), Some(Operation::Verify));
+        assert_eq!(op("cargo fmt --check"), Some(Operation::Verify));
+        assert_eq!(op("cargo fmt"), Some(Operation::Mutate));
+        assert_eq!(op("opavs phase set ACT"), Some(Operation::PhaseState));
+        assert_eq!(
+            op("opavs tasks set-status a done"),
+            Some(Operation::TaskState)
+        );
+        assert_eq!(op("opavs upgrade"), Some(Operation::Publish));
+        assert_eq!(op("opavs uninstall"), Some(Operation::Publish));
+        assert_eq!(op("opavs uninstall --dry-run"), Some(Operation::Inspect));
+        // The flag is not positional: `--target` may come first.
+        assert_eq!(
+            op("opavs uninstall --target claude --dry-run"),
+            Some(Operation::Inspect)
+        );
+        assert_eq!(
+            op("opavs uninstall --target claude"),
+            Some(Operation::Publish)
+        );
+        assert_eq!(op("hj handoff"), Some(Operation::Handoff));
+
+        // Unrecognised programs and subcommands classify to nothing, so every
+        // phase but ACT fails closed on them.
+        assert_eq!(op("rm -rf target"), None);
+        assert_eq!(op("git nonsense-subcommand"), None);
+        assert_eq!(op("cargo build"), None);
+        assert_eq!(op("git"), None);
+    }
+
+    #[test]
+    fn act_permits_unclassified_commands_and_no_other_phase_does() {
+        for cmd in [
+            "rm -rf target",
+            "gh issue list",
+            "npm install",
+            "echo commit push",
+            "cargo build",
+        ] {
+            assert!(shell_command_allowed(cmd, Phase::Act), "ACT denied: {cmd}");
+        }
+
+        for phase in [Phase::Orient, Phase::Plan, Phase::Verify, Phase::Ship] {
+            assert!(!shell_command_allowed("rm -rf target", phase), "{phase:?}");
+            assert!(!shell_command_allowed("gh issue list", phase), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn self_upgrade_is_a_publish_operation() {
+        assert!(shell_command_allowed("opavs upgrade", Phase::Ship));
+        for phase in [Phase::Orient, Phase::Plan, Phase::Verify] {
+            assert!(!shell_command_allowed("opavs upgrade", phase), "{phase:?}");
+        }
+        // ACT is unrestricted at the command level, so this is allowed there.
+        // Commit and push are still refused in ACT, but by the dedicated
+        // classifier rather than by this table -- see `permits`.
+        assert!(shell_command_allowed("opavs upgrade", Phase::Act));
+        assert!(matches!(
+            decide("Bash", true, Phase::Act, "/repo"),
+            Verdict::Deny(_)
+        ));
+    }
+
+    /// Uninstall deletes files the user cares about, so it is a publish action
+    /// like `upgrade` -- SHIP only. The dry run reports and touches nothing, so
+    /// it stays inspectable everywhere: refusing it would make it impossible to
+    // find out what a real run would do before authorizing one.
+    #[test]
+    fn uninstall_is_gated_but_its_dry_run_is_always_readable() {
+        for cmd in [
+            "opavs uninstall",
+            "opavs uninstall --target all",
+            "opavs uninstall --purge-repo",
+        ] {
+            assert!(shell_command_allowed(cmd, Phase::Ship), "{cmd}");
+            for phase in [Phase::Orient, Phase::Plan, Phase::Verify] {
+                assert!(!shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
+            }
+        }
+
+        for cmd in [
+            "opavs uninstall --dry-run",
+            "opavs uninstall --target claude --dry-run",
+            "opavs uninstall --purge-repo --dry-run",
+        ] {
+            for phase in ALL_PHASES {
+                assert!(shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_metadata_is_inspectable_in_every_phase() {
+        for phase in [
+            Phase::Orient,
+            Phase::Plan,
+            Phase::Act,
+            Phase::Verify,
+            Phase::Ship,
+        ] {
+            assert!(
+                shell_command_allowed("cargo metadata --no-deps", phase),
+                "{phase:?}"
+            );
+        }
+    }
+
+    const ALL_PHASES: [Phase; 5] = [
+        Phase::Orient,
+        Phase::Plan,
+        Phase::Act,
+        Phase::Verify,
+        Phase::Ship,
+    ];
+
+    #[test]
+    fn opavs_read_only_commands_are_inspectable_in_every_phase() {
+        for cmd in [
+            "opavs doctor",
+            "opavs doctor --home /tmp",
+            "opavs guard",
+            "opavs --help",
+            "opavs --version",
+            "opavs -h",
+            // clap short-circuits on the flag, so this scaffolds nothing.
+            "opavs init --help",
+        ] {
+            for phase in ALL_PHASES {
+                assert!(shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn uniq_single_operand_rewrites_in_place_and_is_refused() {
+        // No operand reads stdin; two operands read the first and write stdout.
+        assert!(shell_command_allowed("uniq", Phase::Verify));
+        assert!(shell_command_allowed("uniq a b", Phase::Verify));
+        for cmd in [
+            "uniq sorted.txt",
+            "uniq -i sorted.txt",
+            "uniq -f 2 sorted.txt",
+        ] {
+            assert!(!shell_command_allowed(cmd, Phase::Verify), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn sort_output_flag_is_refused_outside_act() {
+        assert!(shell_command_allowed("sort", Phase::Verify));
+        for cmd in [
+            "sort -o out.txt",
+            "sort --output out.txt",
+            "sort -o out.txt < in.txt",
+        ] {
+            assert!(!shell_command_allowed(cmd, Phase::Verify), "{cmd}");
+            assert!(shell_command_allowed(cmd, Phase::Act), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn read_only_filters_are_permitted_in_every_phase() {
+        for filter in ["head", "tail", "grep", "wc", "cut", "tr", "jq"] {
+            for phase in ALL_PHASES {
+                assert!(
+                    shell_command_allowed(&format!("{filter} --version"), phase),
+                    "{filter} in {phase:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verification_pipelines_with_quoted_patterns_are_permitted() {
+        for cmd in [
+            "cargo test 2>&1 | tail -30",
+            "rg \"foo;bar\" src",
+            "rg 'foo|bar' src",
+            "cargo test -- --exact \"foo|bar\"",
+        ] {
+            assert!(shell_command_allowed(cmd, Phase::Verify), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn dash_c_target_is_read_only_from_git_commands() {
+        assert_eq!(
+            git_dash_c_target("git -C /repo push origin main"),
+            Some("/repo".to_string())
+        );
+        // `-C` is grep's context flag, not git's directory flag.
+        assert_eq!(git_dash_c_target("rg -C 3 pattern"), None);
+        // The git command's own flag, not the first `-C` anywhere in the line.
+        assert_eq!(
+            git_dash_c_target("echo hi; git -C /repo push"),
+            Some("/repo".to_string())
+        );
+        assert_eq!(git_dash_c_target("git status"), None);
+    }
+
+    #[test]
+    fn file_reads_are_permitted_outside_act() {
+        // `rg` is Inspect in every phase, so this isolates the read: were
+        // `file_read` ever added to the effects precondition, this would fail.
+        assert!(shell_command_allowed("rg pattern < in.txt", Phase::Verify));
+    }
+
+    #[test]
+    fn descriptor_duplication_is_permitted_in_verification() {
+        assert!(shell_command_allowed("cargo test 2>&1", Phase::Verify));
+        // `git status` is Inspect in every phase, so anything refusing it here
+        // would be refusing the redirection rather than the command.
+        assert!(shell_command_allowed("git status 1>&2", Phase::Orient));
+    }
+
+    #[test]
+    fn file_redirection_requires_act() {
+        assert!(!shell_command_allowed("rg foo > out.txt", Phase::Verify));
+        assert!(!shell_command_allowed("rg foo > out.txt", Phase::Ship));
+        assert!(shell_command_allowed("rg foo > out.txt", Phase::Act));
+    }
+
+    #[test]
+    fn opavs_writing_subcommands_stay_confined_to_act() {
+        for cmd in ["opavs init .", "opavs plugin install --target claude"] {
+            assert!(shell_command_allowed(cmd, Phase::Act), "{cmd}");
+            for phase in [Phase::Orient, Phase::Plan, Phase::Verify, Phase::Ship] {
+                assert!(!shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
+            }
+        }
+    }
+
+    /// Every subcommand the CLI exposes must be classified. A subcommand with no
+    /// entry falls through to "unclassified", which fails closed outside ACT --
+    /// so forgetting one does not break the build, it just makes the command
+    /// mysteriously unusable from VERIFY and SHIP. That is exactly how `doctor`,
+    /// `guard`, and `plugin` went missing until this list existed.
+    ///
+    /// Invocations must be ones clap accepts: a bare `opavs phase` is a usage
+    /// error and is correctly unclassified.
+    ///
+    /// Keep in step with the `Command` enum in `main.rs`.
+    #[test]
+    fn every_opavs_subcommand_is_classified() {
+        for cmd in [
+            "opavs init .",
+            "opavs phase get",
+            "opavs tasks list",
+            "opavs guard",
+            "opavs plugin install",
+            "opavs upgrade",
+            "opavs doctor",
+            "opavs uninstall",
+            "opavs uninstall --dry-run",
+        ] {
+            let words: Vec<&str> = cmd.split_whitespace().collect();
+            assert!(classify(&words).is_some(), "unclassified: {cmd}");
+        }
     }
 }
 

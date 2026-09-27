@@ -1,31 +1,117 @@
+//! Scaffolds OPAVS state, memory-bank, instruction, and ignore files.
+
 use anyhow::{Result, bail};
 use std::path::Path;
 
 const TASKS_TEMPLATE: &str = "tasks: []\n";
 
-const ACTIVE_CONTEXT_TEMPLATE: &str = "# Active Context\n\n\
+pub(crate) const ACTIVE_CONTEXT_TEMPLATE: &str = "# Active Context\n\n\
     _Updated at the end of ACT or after SHIP. What's in flight, what's next._\n";
 
-const PROGRESS_TEMPLATE: &str = "# Progress\n\n\
+pub(crate) const PROGRESS_TEMPLATE: &str = "# Progress\n\n\
     _Milestones as they land. Append, don't rewrite history._\n";
 
-const OPAVS_TEMPLATE: &str = "# OPAVS\n\n\
-    This repo uses the opavs (Orient-Plan-Act-Verify-Ship) phase discipline.\n\n\
-    - Task graph: `.ctx/opavs/tasks.yaml` (managed via `opavs tasks`)\n\
-    - Memory bank: `.ctx/opavs/memory-bank/` (`active-context.md`, `progress.md`)\n\
-    - Current phase: `.ctx/opavs/phase` (managed via `opavs phase`, not committed)\n";
+/// Opening marker of the block `init` appends to instruction files.
+pub(crate) const WORKFLOW_BEGIN: &str = "<!-- opavs-workflow:begin -->";
 
-const OPAVS_LINK: &str = "@OPAVS.md";
+/// Closing marker of the block `init` appends to instruction files.
+pub(crate) const WORKFLOW_END: &str = "<!-- opavs-workflow:end -->";
+
+/// The `.gitignore` line `init` adds, and `uninstall --purge-repo` removes.
+pub(crate) const GITIGNORE_PHASE_ENTRY: &str = ".ctx/opavs/phase";
+
+pub(crate) const OPAVS_TEMPLATE: &str = r##"<!-- opavs-workflow:begin -->
+
+# Phased workflow
+
+Unless the user clearly opts out (for example, **"skip plan, just fix it"**), every
+non-trivial task progresses through five phases. Short confirmations such as
+**"do it"**, **"act"**, and **"go"** advance to the next phase.
+
+## Phases
+
+<opavs-phase name="ORIENT" mode="read-only" response-header="# Phase: ORIENT" skills="opavs">
+Default phase. Read files, search code, run `opavs phase get`, and check the task
+graph with `opavs tasks list`. Summarize the branch, dirty files, and relevant
+context. Do not modify the repository. End by stating what you found and which
+phase comes next.
+</opavs-phase>
+
+<opavs-phase name="PLAN" mode="read-only" response-header="# Phase: PLAN" skills="brainstorm, writing-plans">
+Produce a written plan covering files to touch, approach, tests, and risks. Stay
+read-only: no edits and no builds that write output. For complex work, invoke an
+applicable brainstorming or planning skill. End with "Type ACT to proceed" or
+suggest refinements.
+</opavs-phase>
+
+<opavs-phase name="ACT" mode="read-write" response-header="# Phase: ACT" skills="task-driven-development, parallel-agents">
+Enter when the user approves with "act", "go ahead", or "do it". Set the phase
+with `opavs phase set ACT`, edit files, run commands, and dispatch subagents. Use
+the task graph for multi-step work and parallel agents for independent tasks.
+After finishing, transition to VERIFY automatically.
+</opavs-phase>
+
+<opavs-phase name="VERIFY" mode="read + test" response-header="# Phase: VERIFY" skills="verification-before-completion">
+Set the phase with `opavs phase set VERIFY`. Run the relevant checks, including
+`cargo check`, `cargo clippy`, and `cargo test` for Rust changes. Report results.
+If failures exist, return to ACT to fix them. When green, state readiness and ask
+the user to SHIP.
+</opavs-phase>
+
+<opavs-phase name="SHIP" mode="commit/push" response-header="# Phase: SHIP" skills="cap, handoff">
+Enter only with explicit user approval. Set the phase with `opavs phase set SHIP`,
+commit, push, and update the handoff or memory bank. After shipping, return to
+ORIENT for the next task.
+</opavs-phase>
+
+## Phase transitions
+
+- **Users can skip phases**: "skip plan, implement now" jumps to ACT. "Just fix
+  it" implies ORIENT -> ACT -> VERIFY in one pass; SHIP still requires explicit
+  approval.
+- **After each ACT turn**, default to VERIFY unless the user says otherwise.
+- **Multiple ACT turns** are allowed; the user can keep approving refinements.
+- When the user gives a lettered choice or short confirmation, advance to the
+  most obvious next phase without asking again.
+
+## Skill invocation rule
+
+Before responding in any phase, check whether an available skill applies. Invoke
+process skills such as brainstorming or systematic debugging before implementation
+skills such as task-driven development or parallel agents.
+
+## Task graph
+
+Tasks live in `.ctx/opavs/tasks.yaml`. Use the `opavs tasks` CLI for state
+transitions. Independent chains can run in parallel. A task is runnable when all
+items in `depends_on` are done.
+
+## Memory bank
+
+- Persistent context lives in `.ctx/memory-bank/`.
+- Read `active-context.md` and `progress.md` before substantive work.
+- Update the memory bank after milestones and after shipping.
+- See `AGENTS.md` for repository-specific guidance.
+
+## Agent-specific guidance
+
+For subagent conventions and repository-specific instructions, see `AGENTS.md`.
+
+<!-- opavs-workflow:end -->
+"##;
+
+pub(crate) const OPAVS_LINK: &str = "@OPAVS.md";
 
 /// Scaffold the files opavs requires in a target repo: task graph, memory
 /// bank, canonical instructions, and instruction-file links. Refuses to
 /// overwrite generated state or an existing OPAVS.md.
 pub fn scaffold(repo_root: &Path) -> Result<Vec<String>> {
+    // TODO(init-repair): Add a repair/refresh mode for partial or stale scaffolds.
     let mut created = Vec::new();
 
     let opavs_dir = repo_root.join(".ctx").join("opavs");
     let tasks_file = opavs_dir.join("tasks.yaml");
-    let memory_bank = opavs_dir.join("memory-bank");
+    let memory_bank = repo_root.join(".ctx").join("memory-bank");
     let active_context = memory_bank.join("active-context.md");
     let progress = memory_bank.join("progress.md");
     let opavs = repo_root.join("OPAVS.md");
@@ -41,6 +127,7 @@ pub fn scaffold(repo_root: &Path) -> Result<Vec<String>> {
         }
     }
 
+    std::fs::create_dir_all(&opavs_dir)?;
     std::fs::create_dir_all(&memory_bank)?;
     std::fs::write(&tasks_file, TASKS_TEMPLATE)?;
     created.push(tasks_file.display().to_string());
@@ -63,7 +150,7 @@ pub fn scaffold(repo_root: &Path) -> Result<Vec<String>> {
         created.push(agents.display().to_string());
     }
 
-    append_gitignore_entry(repo_root, ".ctx/opavs/phase")?;
+    append_gitignore_entry(repo_root, GITIGNORE_PHASE_ENTRY)?;
 
     Ok(created)
 }
@@ -121,20 +208,23 @@ mod tests {
         assert!(tmp.path().join(".ctx/opavs/tasks.yaml").is_file());
         assert!(
             tmp.path()
-                .join(".ctx/opavs/memory-bank/active-context.md")
+                .join(".ctx/memory-bank/active-context.md")
                 .is_file()
         );
-        assert!(
-            tmp.path()
-                .join(".ctx/opavs/memory-bank/progress.md")
-                .is_file()
-        );
+        assert!(tmp.path().join(".ctx/memory-bank/progress.md").is_file());
         assert!(tmp.path().join("AGENTS.md").is_file());
         assert!(tmp.path().join("OPAVS.md").is_file());
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap(),
             OPAVS_TEMPLATE
         );
+        let opavs = std::fs::read_to_string(tmp.path().join("OPAVS.md")).unwrap();
+        assert!(opavs.contains("<!-- opavs-workflow:begin -->"));
+        assert!(opavs.contains("<opavs-phase name=\"ORIENT\""));
+        assert!(opavs.contains("## Phase transitions"));
+        assert!(opavs.contains("## Task graph"));
+        assert!(opavs.contains("## Memory bank"));
+        assert!(opavs.contains("<!-- opavs-workflow:end -->"));
     }
 
     #[test]
