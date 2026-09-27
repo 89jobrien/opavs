@@ -553,6 +553,71 @@ fn guard_allows_opavs_self_inspection_in_ship_phase() {
 }
 
 #[test]
+fn guard_allows_quoted_delimiters_in_verify_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    opavs()
+        .current_dir(tmp.path())
+        .args(["phase", "set", "VERIFY"])
+        .assert()
+        .success();
+
+    for command in ["rg \"foo;bar\" src", "rg 'foo|bar' src", "rg \"a > b\" src"] {
+        let hook = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": tmp.path().display().to_string(),
+        });
+
+        opavs()
+            .args(["guard"])
+            .write_stdin(hook.to_string())
+            .assert()
+            .success()
+            .stdout("{\"continue\": true}\n");
+    }
+}
+
+#[test]
+fn guard_separates_descriptor_duplication_from_file_writes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    opavs().arg("init").arg(tmp.path()).assert().success();
+    opavs()
+        .current_dir(tmp.path())
+        .args(["phase", "set", "VERIFY"])
+        .assert()
+        .success();
+
+    let permitted = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "cargo test 2>&1"},
+        "cwd": tmp.path().display().to_string(),
+    });
+    opavs()
+        .args(["guard"])
+        .write_stdin(permitted.to_string())
+        .assert()
+        .success()
+        .stdout("{\"continue\": true}\n");
+
+    for command in ["rg foo > out.txt", "echo $(whoami)"] {
+        let hook = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": tmp.path().display().to_string(),
+        });
+        opavs()
+            .args(["guard"])
+            .write_stdin(hook.to_string())
+            .assert()
+            .success()
+            .stdout(predicates::str::contains(
+                "File mutations are only allowed in ACT",
+            ));
+    }
+}
+
+#[test]
 fn tasks_validate_reports_cycle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     opavs().arg("init").arg(tmp.path()).assert().success();
