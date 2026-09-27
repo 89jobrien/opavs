@@ -39,6 +39,11 @@ Hexagonal (see `~/.claude/skills/writing-solid-rust`):
   integration files under an explicit home directory. Its shared expected-artifact
   catalog covers OPAVS-owned files and neutral expectations for user-owned client
   configuration; installation and doctor diagnosis must consume the same catalog.
+- `src/uninstall.rs` — reverses `plugin::install` and `init::scaffold` by reading
+  those same expectations, so removal cannot drift from installation. Owned
+  artifacts are deleted only while their contents still match what OPAVS wrote;
+  shared configuration is edited to excise the OPAVS entry and never deleted. Every
+  mutation is behind an `apply` flag so `--dry-run` shares one code path.
 - `src/upgrade.rs` — resolves the current platform release and replaces the
   installed executable after downloading and unpacking it.
 - `src/main.rs` — composition root: clap CLI wiring subcommands to adapters.

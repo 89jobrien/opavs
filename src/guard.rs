@@ -312,6 +312,15 @@ fn classify_opavs<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
         // the only phase that permits one.
         ("upgrade", _) => Operation::Publish,
 
+        // Removal takes work off the machine and deletes files, so it is gated
+        // like publishing. `--dry-run` only reports, which is why it is matched
+        // ahead of the general arm -- and it is searched across every argument,
+        // because `--target <name>` may precede it.
+        ("uninstall", Some(_)) if args.iter().any(|arg| arg.as_ref() == "--dry-run") => {
+            Operation::Inspect
+        }
+        ("uninstall", _) => Operation::Publish,
+
         _ => return None,
     })
 }
@@ -680,6 +689,17 @@ mod tests {
             Some(Operation::TaskState)
         );
         assert_eq!(op("opavs upgrade"), Some(Operation::Publish));
+        assert_eq!(op("opavs uninstall"), Some(Operation::Publish));
+        assert_eq!(op("opavs uninstall --dry-run"), Some(Operation::Inspect));
+        // The flag is not positional: `--target` may come first.
+        assert_eq!(
+            op("opavs uninstall --target claude --dry-run"),
+            Some(Operation::Inspect)
+        );
+        assert_eq!(
+            op("opavs uninstall --target claude"),
+            Some(Operation::Publish)
+        );
         assert_eq!(op("hj handoff"), Some(Operation::Handoff));
 
         // Unrecognised programs and subcommands classify to nothing, so every
@@ -722,6 +742,34 @@ mod tests {
             decide("Bash", true, Phase::Act, "/repo"),
             Verdict::Deny(_)
         ));
+    }
+
+    /// Uninstall deletes files the user cares about, so it is a publish action
+    /// like `upgrade` -- SHIP only. The dry run reports and touches nothing, so
+    /// it stays inspectable everywhere: refusing it would make it impossible to
+    // find out what a real run would do before authorizing one.
+    #[test]
+    fn uninstall_is_gated_but_its_dry_run_is_always_readable() {
+        for cmd in [
+            "opavs uninstall",
+            "opavs uninstall --target all",
+            "opavs uninstall --purge-repo",
+        ] {
+            assert!(shell_command_allowed(cmd, Phase::Ship), "{cmd}");
+            for phase in [Phase::Orient, Phase::Plan, Phase::Verify] {
+                assert!(!shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
+            }
+        }
+
+        for cmd in [
+            "opavs uninstall --dry-run",
+            "opavs uninstall --target claude --dry-run",
+            "opavs uninstall --purge-repo --dry-run",
+        ] {
+            for phase in ALL_PHASES {
+                assert!(shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
+            }
+        }
     }
 
     #[test]
@@ -885,6 +933,8 @@ mod tests {
             "opavs plugin install",
             "opavs upgrade",
             "opavs doctor",
+            "opavs uninstall",
+            "opavs uninstall --dry-run",
         ] {
             let words: Vec<&str> = cmd.split_whitespace().collect();
             assert!(classify(&words).is_some(), "unclassified: {cmd}");

@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use opavs::adapters::{FsArtifactReader, FsPhaseStore, FsTaskStore, GitIgnoreQuery};
 use opavs::domain::{self, Phase, PhaseStore, TaskStatus, TaskStore};
-use opavs::{doctor, guard, import, init, plugin, repo, upgrade};
+use opavs::{doctor, guard, import, init, plugin, repo, uninstall, upgrade};
 use std::env;
 use std::io::Read;
 use std::path::PathBuf;
@@ -57,6 +57,27 @@ enum Command {
         #[arg(long)]
         home: Option<PathBuf>,
     },
+    /// Remove OPAVS client integrations, and optionally this repository's scaffolding.
+    Uninstall {
+        /// Which client integration to remove (defaults to every target).
+        #[arg(long, value_enum, default_value = "all")]
+        target: PluginTarget,
+        /// Override the home directory the removal reads.
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Also remove a repository's OPAVS scaffolding, memory bank, and
+        /// instruction blocks. Requires --repo.
+        #[arg(long)]
+        purge_repo: bool,
+        /// The repository to purge. Mandatory with --purge-repo, and never
+        /// inferred: this deletes a task graph, so it must be named outright
+        /// rather than resolved from the working directory.
+        #[arg(long, requires = "purge_repo")]
+        repo: Option<PathBuf>,
+        /// Report what would be removed without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -100,6 +121,31 @@ enum PluginTarget {
     Gemini,
     Opencode,
     All,
+}
+
+impl PluginTarget {
+    /// The integration targets this selection names, in installation order.
+    fn resolve(self) -> Vec<plugin::Target> {
+        let one = |target| vec![target];
+        match self {
+            PluginTarget::Claude => one(plugin::Target::Claude),
+            PluginTarget::Codex => one(plugin::Target::Codex),
+            PluginTarget::Gemini => one(plugin::Target::Gemini),
+            PluginTarget::Opencode => one(plugin::Target::Opencode),
+            PluginTarget::All => vec![
+                plugin::Target::Claude,
+                plugin::Target::Codex,
+                plugin::Target::Gemini,
+                plugin::Target::Opencode,
+            ],
+        }
+    }
+}
+
+fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    explicit
+        .or_else(|| env::var("HOME").ok().map(PathBuf::from))
+        .ok_or_else(|| anyhow::anyhow!("unable to resolve home directory; pass --home explicitly"))
 }
 
 fn find_repo_root(explicit: Option<&PathBuf>) -> Result<PathBuf> {
@@ -190,26 +236,9 @@ fn main() -> Result<()> {
         Command::Guard => run_guard()?,
         Command::Plugin { action } => match action {
             PluginAction::Install { target, home } => {
-                let home = home
-                    .or_else(|| env::var("HOME").ok().map(PathBuf::from))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("unable to resolve home directory; pass --home explicitly")
-                    })?;
+                let home = resolve_home(home)?;
 
-                let targets: Vec<plugin::Target> = match target {
-                    PluginTarget::Claude => vec![plugin::Target::Claude],
-                    PluginTarget::Codex => vec![plugin::Target::Codex],
-                    PluginTarget::Gemini => vec![plugin::Target::Gemini],
-                    PluginTarget::Opencode => vec![plugin::Target::Opencode],
-                    PluginTarget::All => vec![
-                        plugin::Target::Claude,
-                        plugin::Target::Codex,
-                        plugin::Target::Gemini,
-                        plugin::Target::Opencode,
-                    ],
-                };
-
-                for t in targets {
+                for t in target.resolve() {
                     let changed = plugin::install(t, &home)?;
                     let label = t.as_str();
                     if changed.is_empty() {
@@ -232,11 +261,7 @@ fn main() -> Result<()> {
             }
         },
         Command::Doctor { repo_root, home } => {
-            let home = home
-                .or_else(|| env::var("HOME").ok().map(PathBuf::from))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("unable to resolve home directory; pass --home explicitly")
-                })?;
+            let home = resolve_home(home)?;
             let report = doctor::inspect(
                 &FsArtifactReader,
                 &GitIgnoreQuery,
@@ -248,6 +273,33 @@ fn main() -> Result<()> {
             if report.has_errors() {
                 bail!("doctor found errors");
             }
+        }
+        Command::Uninstall {
+            target,
+            home,
+            purge_repo,
+            repo,
+            dry_run,
+        } => {
+            let home = resolve_home(home)?;
+            let mut report = uninstall::Report::default();
+            for t in target.resolve() {
+                report.merge(uninstall::remove_target(t, &home, !dry_run)?);
+            }
+            if purge_repo {
+                let repo_root = repo.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--purge-repo deletes a task graph, so it needs an explicit --repo <path>"
+                    )
+                })?;
+                report.merge(uninstall::purge_repo(&repo_root, !dry_run)?);
+            }
+            render_uninstall_report(&report, dry_run);
+
+            println!(
+                "remove the executable with: cargo install --uninstall --name {}",
+                env!("CARGO_PKG_NAME")
+            );
         }
     }
 
@@ -283,6 +335,27 @@ fn render_doctor_report(report: &doctor::DoctorReport) {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn render_uninstall_report(report: &uninstall::Report, dry_run: bool) {
+    let verb = if dry_run { "would remove" } else { "removed" };
+    let edited_verb = if dry_run { "would edit" } else { "edited" };
+
+    if report.is_empty() {
+        println!("nothing to remove");
+        return;
+    }
+    for path in &report.removed {
+        println!("{verb} {path}");
+    }
+    for path in &report.edited {
+        println!("{edited_verb} {path} (kept surrounding configuration)");
+    }
+    for path in &report.preserved {
+        println!(
+            "kept {path} (modified after install; delete it yourself if you no longer want it)"
+        );
+    }
 }
 
 /// What a PreToolUse hook call resolves to before any repo/phase lookup:

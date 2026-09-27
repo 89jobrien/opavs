@@ -90,6 +90,36 @@ fn readme_documents_the_guard_effects_rule() {
 }
 
 #[test]
+fn readme_documents_uninstall_ownership_rules() {
+    let readme = repo_file("README.md");
+
+    assert_concepts(
+        &readme,
+        "README.md",
+        &[
+            "opavs uninstall",
+            "--dry-run",
+            "--purge-repo",
+            "Owned",
+            "Shared",
+            "byte-identical",
+            "cargo install --uninstall",
+        ],
+    );
+}
+
+#[test]
+fn claude_documents_the_uninstall_module() {
+    let claude = repo_file("CLAUDE.md");
+
+    assert_concepts(
+        &claude,
+        "CLAUDE.md",
+        &["src/uninstall.rs", "reverses `plugin::install`", "apply"],
+    );
+}
+
+#[test]
 fn readme_documents_doctor_behavior_and_architecture() {
     let readme = repo_file("README.md");
 

@@ -474,7 +474,7 @@ fn ensure_opencode_plugin_entry(root: &mut Value, plugin_ref: &str) -> Result<()
     Ok(())
 }
 
-fn read_json_or_default(path: &Path) -> Result<Value> {
+pub(crate) fn read_json_or_default(path: &Path) -> Result<Value> {
     if !path.exists() {
         return Ok(Value::Object(Map::new()));
     }
@@ -485,7 +485,7 @@ fn read_json_or_default(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
-fn write_json_if_changed(path: &Path, value: &Value) -> Result<bool> {
+pub(crate) fn write_json_if_changed(path: &Path, value: &Value) -> Result<bool> {
     let rendered = serde_json::to_string_pretty(value)?;
     write_if_changed(path, &(rendered + "\n"))
 }

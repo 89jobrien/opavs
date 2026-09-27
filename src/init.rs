@@ -5,11 +5,20 @@ use std::path::Path;
 
 const TASKS_TEMPLATE: &str = "tasks: []\n";
 
-const ACTIVE_CONTEXT_TEMPLATE: &str = "# Active Context\n\n\
+pub(crate) const ACTIVE_CONTEXT_TEMPLATE: &str = "# Active Context\n\n\
     _Updated at the end of ACT or after SHIP. What's in flight, what's next._\n";
 
-const PROGRESS_TEMPLATE: &str = "# Progress\n\n\
+pub(crate) const PROGRESS_TEMPLATE: &str = "# Progress\n\n\
     _Milestones as they land. Append, don't rewrite history._\n";
+
+/// Opening marker of the block `init` appends to instruction files.
+pub(crate) const WORKFLOW_BEGIN: &str = "<!-- opavs-workflow:begin -->";
+
+/// Closing marker of the block `init` appends to instruction files.
+pub(crate) const WORKFLOW_END: &str = "<!-- opavs-workflow:end -->";
+
+/// The `.gitignore` line `init` adds, and `uninstall --purge-repo` removes.
+pub(crate) const GITIGNORE_PHASE_ENTRY: &str = ".ctx/opavs/phase";
 
 pub(crate) const OPAVS_TEMPLATE: &str = r##"<!-- opavs-workflow:begin -->
 
@@ -141,7 +150,7 @@ pub fn scaffold(repo_root: &Path) -> Result<Vec<String>> {
         created.push(agents.display().to_string());
     }
 
-    append_gitignore_entry(repo_root, ".ctx/opavs/phase")?;
+    append_gitignore_entry(repo_root, GITIGNORE_PHASE_ENTRY)?;
 
     Ok(created)
 }

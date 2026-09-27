@@ -97,6 +97,42 @@ treated as additional context and are never executed as shell commands.
 
 Gemini retains its extension and context integration but does not receive the
 phase slash commands. Re-running plugin installation updates changed artifacts;
+`opavs uninstall` reverses it.
+
+### Uninstall
+
+`opavs uninstall` removes what OPAVS installed, and is driven by the same artifact
+list `opavs plugin install` uses, so the two cannot drift.
+
+```bash
+opavs uninstall --dry-run                 # report everything, change nothing
+opavs uninstall                            # remove every client integration
+opavs uninstall --target claude           # remove one integration
+opavs uninstall --purge-repo --repo .     # also strip this repo's scaffolding
+```
+
+Two rules keep it from destroying anything it did not create:
+
+- **Owned** artifacts — the skill, phase commands, hook manifest, plugin
+  package — are deleted only when their contents still match what OPAVS wrote.
+  A file you have edited is reported and left in place.
+- **Shared** configuration is never deleted. The OPAVS entry is excised from
+  `~/.codex/hooks.json`, `~/.gemini/extensions/extension-enablement.json`, and
+  `~/.config/opencode/opencode.json`, and everything around it is left as it was.
+  A file OPAVS never touched comes out byte-identical.
+
+`--purge-repo` requires an explicit `--repo` path rather than resolving one from
+the working directory, because it deletes the task graph. It removes
+`.ctx/opavs/`, `OPAVS.md`, the appended workflow block in `AGENTS.md`/`CLAUDE.md`,
+and the `.gitignore` line `init` added. Memory-bank files survive if you have
+written into them, and are removed only while they still hold the generated
+template.
+
+Uninstall is gated to the `SHIP` phase, since it deletes files and takes work off
+the machine. `--dry-run` only reports, so it stays available in every phase.
+
+The command removes OPAVS's artifacts but not the executable itself; remove that
+with `cargo install --uninstall --name opavs`.
 when nothing changed, the target reports that it is already up to date.
 
 `opavs guard` is meant to be wired as a `PreToolUse` hook. Claude and Codex use
@@ -142,8 +178,10 @@ diagnosis and repair-planning service. `adapters` implements state ports against
 the filesystem and backs doctor with filesystem reads plus read-only Git ignore
 queries. `guard` owns pure policy decisions and shell classification. `init`,
 `plugin`, and `upgrade` are filesystem/network-facing adapters, while plugin
-installation and doctor share the same client-artifact expectations. `main.rs`
-is the composition root wiring clap subcommands to them.
+installation, doctor, and `uninstall` all read the same client-artifact
+expectations from `plugin`, so install, diagnosis, and removal cannot disagree
+about what OPAVS owns. `main.rs` is the composition root wiring clap subcommands
+to them.
 
 ## Build
 

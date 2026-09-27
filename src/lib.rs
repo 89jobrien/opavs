@@ -10,4 +10,5 @@ pub mod integration;
 pub mod plugin;
 pub mod repo;
 pub mod shell;
+pub mod uninstall;
 pub mod upgrade;
