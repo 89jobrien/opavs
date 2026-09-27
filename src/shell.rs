@@ -80,6 +80,9 @@ pub fn parse(line: &str) -> Vec<Command> {
             '"' => match ch {
                 '"' => quote = '\0',
                 '\\' => escaped = true,
+                // `$`, backtick, and `\` still expand inside double quotes.
+                '`' => current.effects.substitution = true,
+                '$' if chars.peek() == Some(&'(') => current.effects.substitution = true,
                 _ => {
                     word.push(ch);
                     in_word = true;
@@ -90,6 +93,14 @@ pub fn parse(line: &str) -> Vec<Command> {
                 '\'' | '"' => {
                     quote = ch;
                     in_word = true;
+                }
+                '`' => {
+                    current.effects.substitution = true;
+                    end_word(&mut current, &mut word, &mut in_word);
+                }
+                '$' if chars.peek() == Some(&'(') => {
+                    current.effects.substitution = true;
+                    end_word(&mut current, &mut word, &mut in_word);
                 }
                 '&' if chars.peek() == Some(&'>') => {
                     // `&> file` redirects both streams to a file.
@@ -174,6 +185,15 @@ mod tests {
             .map(|command| command.args)
             .collect();
         assert_eq!(words, vec![vec!["rg", "foo;bar", "src"]]);
+    }
+
+    #[test]
+    fn detects_command_substitution_except_inside_single_quotes() {
+        for cmd in ["echo $(whoami)", "echo `whoami`", "echo \"$(whoami)\""] {
+            assert!(parse(cmd)[0].effects.substitution, "{cmd}");
+        }
+        // Single quotes are literal, so this is not a substitution.
+        assert!(!parse("echo '$(whoami)'")[0].effects.substitution);
     }
 
     #[test]
