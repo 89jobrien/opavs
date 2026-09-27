@@ -83,6 +83,13 @@ fn claude_documents_doctor_adapter_and_integration_architecture() {
 }
 
 #[test]
+fn readme_documents_the_guard_effects_rule() {
+    let readme = repo_file("README.md");
+
+    assert_concepts(&readme, "README.md", &["descriptor", "substitution", "tee"]);
+}
+
+#[test]
 fn readme_documents_doctor_behavior_and_architecture() {
     let readme = repo_file("README.md");
 

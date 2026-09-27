@@ -108,6 +108,12 @@ OPAVS phase/task queries, read-only Git and discovery commands, Cargo metadata,
 and phase-appropriate verification or handoff commands. Unknown commands are
 denied.
 
+Within that allowlist, reading a file (`< file`) and duplicating a file descriptor
+(`2>&1`) are permitted in every phase: neither mutates anything. Writing to a path
+(`> file`, `>> file`, `&> file`) and command substitution (`$(...)`, backticks, and
+the process substitutions `<(...)` and `>(...)`) are permitted only in `ACT`, as is
+`tee`, which writes files by design.
+
 **Fail-open by design outside opavs-enabled repos.** Resolution walks upward
 from the target directory but stops at the nearest Git repository or worktree
 boundary. If no `.ctx/opavs/tasks.yaml` is found before that boundary (or the
