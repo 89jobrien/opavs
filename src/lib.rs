@@ -9,4 +9,5 @@ pub mod init;
 pub mod integration;
 pub mod plugin;
 pub mod repo;
+pub mod shell;
 pub mod upgrade;

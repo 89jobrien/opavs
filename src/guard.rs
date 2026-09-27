@@ -1,6 +1,7 @@
 //! Pure policy decisions for phase-gated tool and shell-command execution.
 
 use crate::domain::Phase;
+use crate::shell;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -132,35 +133,27 @@ fn permits(phase: Phase, op: Operation) -> bool {
     }
 }
 
-/// Return whether every segment of `cmd` performs an operation `phase` permits.
+/// Return whether every command in `cmd` performs an operation `phase` permits.
 ///
 /// Unknown programs fail closed, except in ACT, which is the working phase.
 pub fn shell_command_allowed(cmd: &str, phase: Phase) -> bool {
-    // TODO(shell-parser): Replace delimiter splitting with quote-aware shell analysis.
-    cmd.split([';', '&', '|'])
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .all(|segment| {
-            if segment.contains(['>', '<', '`']) || segment.contains("$(") {
-                return false;
-            }
-            let words: Vec<&str> = segment.split_whitespace().collect();
-            match classify(&words) {
-                Some(op) => permits(phase, op),
-                // ACT permits commands the gate has no policy for; every other
-                // phase fails closed on an unrecognised program.
-                None => phase == Phase::Act,
-            }
+    shell::parse(cmd)
+        .iter()
+        .all(|command| match classify(&command.args) {
+            Some(operation) => permits(phase, operation),
+            // ACT permits commands the gate has no policy for; every other phase
+            // fails closed on an unrecognised program.
+            None => phase == Phase::Act,
         })
 }
 
-/// Classify one shell segment into the operation it performs.
+/// Classify one shell command into the operation it performs.
 ///
 /// Purely a function of the command: nothing here consults the phase, so the
 /// per-phase policy lives in exactly one place (`permits`). `None` means the gate
 /// has no policy for this program, which callers treat as fail-closed.
-fn classify(words: &[&str]) -> Option<Operation> {
-    let program = words.first()?;
+fn classify<S: AsRef<str>>(words: &[S]) -> Option<Operation> {
+    let program = words.first()?.as_ref();
     let program = program.rsplit('/').next().unwrap_or(program);
     let args = &words[1..];
 
@@ -168,7 +161,7 @@ fn classify(words: &[&str]) -> Option<Operation> {
         "git" => classify_git(words),
         "cargo" => classify_cargo(args),
         "opavs" => classify_opavs(args),
-        "hj" | "godmode" => (args.first() == Some(&"handoff")).then_some(Operation::Handoff),
+        "hj" | "godmode" => (args.first()?.as_ref() == "handoff").then_some(Operation::Handoff),
         // Reading the filesystem and locating binaries changes nothing.
         "pwd" | "ls" | "rg" | "fd" | "file" | "which" => Some(Operation::Inspect),
         // The project's own smoke driver builds a throwaway repo in a temp dir
@@ -176,30 +169,31 @@ fn classify(words: &[&str]) -> Option<Operation> {
         // phase as it was before this table existed.
         "nu" => args
             .first()
-            .is_some_and(|path| path.ends_with(".claude/skills/run-opavs/smoke.nu"))
+            .is_some_and(|path| path.as_ref().ends_with(".claude/skills/run-opavs/smoke.nu"))
             .then_some(Operation::Inspect),
         _ => None,
     }
 }
 
-fn classify_git(words: &[&str]) -> Option<Operation> {
-    let git = git_invocation(words)?;
-    let args = &words[git.index + 1..];
+fn classify_git<S: AsRef<str>>(words: &[S]) -> Option<Operation> {
+    let index = git_invocation(words)?;
+    let args = &words[index + 1..];
+    let one_arg = |expected: &str| args.len() == 1 && args[0].as_ref() == expected;
 
-    Some(match git.subcommand {
+    Some(match words[index].as_ref() {
         "status" | "diff" | "log" | "show" | "rev-parse" => Operation::Inspect,
 
         // Listing is read-only, but the mutating forms of these two verbs are
         // not, so they stay argument-sensitive: `git branch -d` deletes a branch
         // and `git remote add` rewrites config.
-        "branch" if args.is_empty() || args == ["--show-current"] => Operation::Inspect,
-        "remote" if args == ["-v"] => Operation::Inspect,
+        "branch" if args.is_empty() || one_arg("--show-current") => Operation::Inspect,
+        "remote" if one_arg("-v") => Operation::Inspect,
 
         "add" => Operation::Stage,
         // The `--staged` form only rewrites the index. Bare `git restore`
         // overwrites working-tree content from the index, which is why it falls
         // through to Mutate below.
-        "restore" if args.first() == Some(&"--staged") => Operation::Stage,
+        "restore" if args.first().is_some_and(|a| a.as_ref() == "--staged") => Operation::Stage,
 
         "commit" | "push" => Operation::Publish,
 
@@ -214,14 +208,14 @@ fn classify_git(words: &[&str]) -> Option<Operation> {
     })
 }
 
-fn classify_cargo(args: &[&str]) -> Option<Operation> {
-    Some(match *args.first()? {
+fn classify_cargo<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
+    Some(match args.first()?.as_ref() {
         // Reading the manifest graph changes nothing.
         "metadata" => Operation::Inspect,
         "check" | "clippy" | "test" => Operation::Verify,
-        "nextest" if args.get(1) == Some(&"run") => Operation::Verify,
+        "nextest" if args.get(1).is_some_and(|a| a.as_ref() == "run") => Operation::Verify,
         // `cargo fmt --check` only reports; without `--check` it rewrites files.
-        "fmt" if args.contains(&"--check") => Operation::Verify,
+        "fmt" if args.iter().any(|a| a.as_ref() == "--check") => Operation::Verify,
         "fmt" => Operation::Mutate,
         // `build`, `doc`, `install` and friends stay unclassified: ACT permits
         // them, and no other phase has a reason to.
@@ -229,19 +223,20 @@ fn classify_cargo(args: &[&str]) -> Option<Operation> {
     })
 }
 
-fn classify_opavs(args: &[&str]) -> Option<Operation> {
+fn classify_opavs<S: AsRef<str>>(args: &[S]) -> Option<Operation> {
     // clap resolves --help/-h/--version/-V before dispatching to any
     // subcommand, wherever the flag appears. So `opavs init --help` prints usage
     // without scaffolding anything and `opavs upgrade --version` reports a
     // version without downloading: all of these are read-only no-ops.
     if args
         .iter()
-        .any(|arg| matches!(*arg, "--help" | "-h" | "--version" | "-V"))
+        .any(|arg| matches!(arg.as_ref(), "--help" | "-h" | "--version" | "-V"))
     {
         return Some(Operation::Inspect);
     }
 
-    Some(match (*args.first()?, args.get(1).copied()) {
+    let second = args.get(1).map(AsRef::as_ref);
+    Some(match (args.first()?.as_ref(), second) {
         ("phase", Some("get" | "set")) => Operation::PhaseState,
         ("tasks", Some("list" | "runnable" | "validate")) => Operation::PhaseState,
         ("tasks", Some("set-status" | "import")) => Operation::TaskState,
@@ -263,36 +258,28 @@ fn classify_opavs(args: &[&str]) -> Option<Operation> {
     })
 }
 
-/// A `git` program token found at the head of a shell segment, resolved to the
-/// subcommand it will actually run.
-struct GitInvocation<'a> {
-    /// Index of the subcommand token within the source `words` slice, so
-    /// callers can recover the arguments that follow it.
-    index: usize,
-    subcommand: &'a str,
-}
-
-/// Recognize a git program at the head of `words` and resolve its subcommand.
+/// Recognize a git program at the head of `words` and return the index of the
+/// subcommand it will run.
 ///
 /// Tolerates a path prefix (`/usr/bin/git`) by comparing the final path
-/// component, exactly as `shell_segment_allowed` does — if the two classifiers
-/// disagree about what "a git command" is, a real `git push` can fall through
-/// to the ACT-only mutation rule and a user who obeys the resulting message is
-/// bounced into the phase that triggers the other one.
+/// component, exactly as `classify` does — if the two classifiers disagree about
+/// what "a git command" is, a real `git push` can fall through to the ACT-only
+/// mutation rule and a user who obeys the resulting message is bounced into the
+/// phase that triggers the other one.
 ///
 /// Skips git global options, and the argument to `-C`/`-c`, so
 /// `git -C /repo push` and `git --no-pager push` both resolve to `push`.
 ///
 /// Returns `None` for a non-git program, or a bare `git` with no subcommand.
-fn git_invocation<'a>(words: &[&'a str]) -> Option<GitInvocation<'a>> {
-    let program = words.first()?;
+fn git_invocation<S: AsRef<str>>(words: &[S]) -> Option<usize> {
+    let program = words.first()?.as_ref();
     if program.rsplit('/').next().unwrap_or(program) != "git" {
         return None;
     }
 
     let mut i = 1;
     while i < words.len() {
-        let word = words[i];
+        let word = words[i].as_ref();
         // `-C <dir>` and `-c <str>` consume the following word.
         if matches!(word, "-C" | "-c") {
             i += 2;
@@ -303,23 +290,20 @@ fn git_invocation<'a>(words: &[&'a str]) -> Option<GitInvocation<'a>> {
             i += 1;
             continue;
         }
-        return Some(GitInvocation {
-            index: i,
-            subcommand: word,
-        });
+        return Some(i);
     }
     None
 }
 
-/// Whether any segment of `cmd` invokes `git commit` or `git push`.
+/// Whether any command in `cmd` invokes `git commit` or `git push`.
 ///
 /// Classification is by git *subcommand*, not by the presence of the words
-/// "commit" or "push" anywhere in the segment: `git log --grep push` is a
+/// "commit" or "push" anywhere in the command: `git log --grep push` is a
 /// read-only query and must not be gated as a push.
 pub fn command_touches_commit_or_push(cmd: &str) -> bool {
-    cmd.split([';', '&', '|']).any(|segment| {
-        let words: Vec<&str> = segment.split_whitespace().collect();
-        git_invocation(&words).is_some_and(|git| matches!(git.subcommand, "commit" | "push"))
+    shell::parse(cmd).iter().any(|command| {
+        git_invocation(&command.args)
+            .is_some_and(|index| matches!(command.args[index].as_str(), "commit" | "push"))
     })
 }
 
