@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+@OPAVS.md
+
 `opavs` — Rust CLI implementing the Orient-Plan-Act-Verify-Ship workflow
 phasing system: it gates what's allowed (edits, commits) based on which
 phase a repo is in, enforced via a PreToolUse guard hook rather than
@@ -21,7 +23,11 @@ Hexagonal (see `~/.claude/skills/writing-solid-rust`):
 - `src/domain.rs` — `Phase`, `Task`/`TaskGraph`, `PhaseStore`/`TaskStore`
   ports (traits), and pure graph logic (validate, runnable_tasks). Zero I/O.
 - `src/adapters.rs` — `FsPhaseStore`/`FsTaskStore`: filesystem implementations
-  of the ports.
+  of the state ports; `FsArtifactReader` backs doctor with filesystem reads and
+  read-only Git ignore queries.
+- `src/doctor.rs` — mutation-free repository and client-integration diagnosis,
+  severity findings, and advisory repair planning over injected reader/Git
+  query capabilities.
 - `src/guard.rs` — pure `decide()` allow/deny logic for the PreToolUse hook.
 - `src/repo.rs` — repo-root resolution (walk up for `.ctx/opavs/tasks.yaml`,
   stopping at the nearest Git repository or worktree boundary).
@@ -30,7 +36,14 @@ Hexagonal (see `~/.claude/skills/writing-solid-rust`):
 - `src/import.rs` — reads an external `GODMODE.tasks.yaml` (same schema) and
   merges it into the repo's graph by id, preserving existing task status.
 - `src/plugin.rs` — installs client hooks, skills, phase commands, and OpenCode
-  integration files under an explicit home directory.
+  integration files under an explicit home directory. Its shared expected-artifact
+  catalog covers OPAVS-owned files and neutral expectations for user-owned client
+  configuration; installation and doctor diagnosis must consume the same catalog.
+- `src/uninstall.rs` — reverses `plugin::install` and `init::scaffold` by reading
+  those same expectations, so removal cannot drift from installation. Owned
+  artifacts are deleted only while their contents still match what OPAVS wrote;
+  shared configuration is edited to excise the OPAVS entry and never deleted. Every
+  mutation is behind an `apply` flag so `--dry-run` shares one code path.
 - `src/upgrade.rs` — resolves the current platform release and replaces the
   installed executable after downloading and unpacking it.
 - `src/main.rs` — composition root: clap CLI wiring subcommands to adapters.
@@ -39,7 +52,7 @@ Hexagonal (see `~/.claude/skills/writing-solid-rust`):
 
 ## Build & Test
 
-```
+```text
 cargo check
 cargo clippy --all-targets
 cargo test

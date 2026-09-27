@@ -1,3 +1,5 @@
+//! Workflow phases, task-graph types, persistence ports, and validation rules.
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -15,6 +17,7 @@ pub enum Phase {
 }
 
 impl Phase {
+    /// Parses an uppercase OPAVS phase name.
     pub fn parse(s: &str) -> Result<Phase> {
         match s {
             "ORIENT" => Ok(Phase::Orient),
@@ -75,6 +78,7 @@ fn default_status() -> TaskStatus {
 }
 
 impl TaskStatus {
+    /// Parses a task status as represented in task-graph YAML.
     pub fn parse(s: &str) -> Result<TaskStatus, String> {
         match s {
             "todo" => Ok(TaskStatus::Todo),
@@ -116,6 +120,7 @@ pub trait TaskStore {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum GraphError {
+    DuplicateId(String),
     UnknownDependency { task: String, depends_on: String },
     Cycle(Vec<String>),
 }
@@ -123,6 +128,7 @@ pub enum GraphError {
 impl fmt::Display for GraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            GraphError::DuplicateId(id) => write!(f, "duplicate task id '{id}'"),
             GraphError::UnknownDependency { task, depends_on } => {
                 write!(f, "task '{task}' depends on unknown task '{depends_on}'")
             }
@@ -131,9 +137,14 @@ impl fmt::Display for GraphError {
     }
 }
 
-/// Pure domain logic: validate a task graph (unknown deps, cycles).
+/// Pure domain logic: validate a task graph (unique IDs, known deps, and no cycles).
 pub fn validate(graph: &TaskGraph) -> Result<(), GraphError> {
-    let ids: std::collections::HashSet<&str> = graph.tasks.iter().map(|t| t.id.as_str()).collect();
+    let mut ids = std::collections::HashSet::new();
+    for task in &graph.tasks {
+        if !ids.insert(task.id.as_str()) {
+            return Err(GraphError::DuplicateId(task.id.clone()));
+        }
+    }
 
     for task in &graph.tasks {
         for dep in &task.depends_on {
@@ -216,6 +227,7 @@ pub fn runnable_tasks(graph: &TaskGraph) -> Vec<&Task> {
 pub mod conformance {
     use super::*;
 
+    /// Verifies that a phase store defaults to Orient and round-trips every phase.
     pub fn assert_phase_store_contract(store: impl PhaseStore) {
         assert_eq!(
             store.get().expect("fresh store defaults to a phase"),
@@ -238,6 +250,7 @@ pub mod conformance {
         }
     }
 
+    /// Verifies that a task store defaults empty, round-trips, and overwrites on save.
     pub fn assert_task_store_contract(store: impl TaskStore) {
         assert!(
             store
@@ -333,6 +346,21 @@ mod tests {
                 task: "a".into(),
                 depends_on: "ghost".into()
             }
+        );
+    }
+
+    #[test]
+    fn validate_detects_duplicate_id() {
+        let graph = TaskGraph {
+            tasks: vec![
+                task("duplicate", TaskStatus::Todo, &[]),
+                task("duplicate", TaskStatus::Done, &[]),
+            ],
+        };
+
+        assert_eq!(
+            validate(&graph),
+            Err(GraphError::DuplicateId("duplicate".to_string()))
         );
     }
 
