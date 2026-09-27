@@ -178,6 +178,10 @@ fn classify<S: AsRef<str>>(words: &[S]) -> Option<Operation> {
         "opavs" => classify_opavs(args),
         "hj" | "godmode" => (args.first()?.as_ref() == "handoff").then_some(Operation::Handoff),
         // Reading the filesystem and locating binaries changes nothing.
+        // Read-only filters, each checked against its man page and confirmed to
+        // have no option that writes to a named path. `sort` and `uniq` are
+        // handled separately below because they do have one.
+        "head" | "tail" | "grep" | "wc" | "cut" | "tr" | "jq" => Some(Operation::Inspect),
         "pwd" | "ls" | "rg" | "fd" | "file" | "which" => Some(Operation::Inspect),
         // The project's own smoke driver builds a throwaway repo in a temp dir
         // and touches nothing in the working tree, so it stays available in every
@@ -720,6 +724,30 @@ mod tests {
             for phase in ALL_PHASES {
                 assert!(shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
             }
+        }
+    }
+
+    #[test]
+    fn read_only_filters_are_permitted_in_every_phase() {
+        for filter in ["head", "tail", "grep", "wc", "cut", "tr", "jq"] {
+            for phase in ALL_PHASES {
+                assert!(
+                    shell_command_allowed(&format!("{filter} --version"), phase),
+                    "{filter} in {phase:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verification_pipelines_with_quoted_patterns_are_permitted() {
+        for cmd in [
+            "cargo test 2>&1 | tail -30",
+            "rg \"foo;bar\" src",
+            "rg 'foo|bar' src",
+            "cargo test -- --exact \"foo|bar\"",
+        ] {
+            assert!(shell_command_allowed(cmd, Phase::Verify), "{cmd}");
         }
     }
 
