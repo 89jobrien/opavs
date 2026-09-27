@@ -339,7 +339,8 @@ fn parse_guard_request(hook: &serde_json::Value, session_cwd: &str) -> GuardRequ
                 .pointer("/tool_input/command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let target_dir = extract_dash_c_target(cmd).unwrap_or_else(|| session_cwd.to_string());
+            let target_dir =
+                guard::git_dash_c_target(cmd).unwrap_or_else(|| session_cwd.to_string());
             GuardRequest::Check {
                 tool: "Bash".to_string(),
                 target_dir,
@@ -427,33 +428,27 @@ fn run_guard() -> Result<()> {
     Ok(())
 }
 
-/// Extract the path argument to a `git -C <path>` flag, if present.
-fn extract_dash_c_target(cmd: &str) -> Option<String> {
-    let words: Vec<&str> = cmd.split_whitespace().collect();
-    let pos = words.iter().position(|w| *w == "-C")?;
-    words.get(pos + 1).map(|s| s.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn extracts_dash_c_target() {
-        assert_eq!(
-            extract_dash_c_target("git -C /repo push origin main"),
-            Some("/repo".to_string())
-        );
+    fn bash_with_non_git_dash_c_keeps_the_session_cwd() {
+        let hook = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "rg -C 3 pattern"},
+            "cwd": "/repo",
+        });
+
+        match parse_guard_request(&hook, "/repo") {
+            GuardRequest::Check { target_dir, .. } => assert_eq!(target_dir, "/repo"),
+            GuardRequest::Allow => panic!("expected a check"),
+        }
     }
 
     #[test]
     fn shell_quote_handles_spaces_and_apostrophes() {
         assert_eq!(shell_quote("a b'c"), "'a b'\"'\"'c'");
-    }
-
-    #[test]
-    fn no_dash_c_target_returns_none() {
-        assert_eq!(extract_dash_c_target("git commit -m x"), None);
     }
 
     fn edit_hook(file_path: &str) -> serde_json::Value {
@@ -623,24 +618,6 @@ mod proptests {
     use proptest::prelude::*;
 
     proptest! {
-        /// No arbitrary UTF-8 input may panic the extractor.
-        #[test]
-        fn extract_dash_c_target_never_panics(cmd in ".*") {
-            let _ = extract_dash_c_target(&cmd);
-        }
-
-        /// When "-C <target>" appears anywhere, it must be extracted verbatim,
-        /// regardless of what surrounds it.
-        #[test]
-        fn extracts_the_word_following_dash_c(
-            prefix in "[a-zA-Z ]{0,10}",
-            target in "[a-zA-Z0-9/_-]{1,10}",
-            suffix in "[a-zA-Z ]{0,10}"
-        ) {
-            let cmd = format!("{prefix} -C {target} {suffix}");
-            prop_assert_eq!(extract_dash_c_target(&cmd), Some(target));
-        }
-
         /// Arbitrary JSON values must never panic hook parsing, regardless of
         /// tool_name/tool_input shape.
         #[test]
