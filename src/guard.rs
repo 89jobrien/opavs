@@ -310,6 +310,24 @@ fn git_invocation<S: AsRef<str>>(words: &[S]) -> Option<usize> {
     None
 }
 
+/// The path argument to a `git -C <path>` flag, if any command in `line` is a
+/// git invocation carrying one.
+///
+/// Segment-aware by construction: a `-C` belonging to a non-git command is not a
+/// directory flag. `rg -C 3 pattern` is grep's context flag, and treating it as
+/// git's would hand the resolver a repo root of `3`.
+///
+/// The flag is searched among the global options preceding the subcommand, which
+/// is where `git_invocation` leaves it after skipping `-C` and its value.
+pub fn git_dash_c_target(line: &str) -> Option<String> {
+    shell::parse(line).iter().find_map(|command| {
+        let index = git_invocation(&command.args)?;
+        let globals = &command.args[1..index];
+        let position = globals.iter().position(|arg| arg == "-C")?;
+        globals.get(position + 1).cloned()
+    })
+}
+
 /// Whether any command in `cmd` invokes `git commit` or `git push`.
 ///
 /// Classification is by git *subcommand*, not by the presence of the words
@@ -703,6 +721,22 @@ mod tests {
                 assert!(shell_command_allowed(cmd, phase), "{cmd} in {phase:?}");
             }
         }
+    }
+
+    #[test]
+    fn dash_c_target_is_read_only_from_git_commands() {
+        assert_eq!(
+            git_dash_c_target("git -C /repo push origin main"),
+            Some("/repo".to_string())
+        );
+        // `-C` is grep's context flag, not git's directory flag.
+        assert_eq!(git_dash_c_target("rg -C 3 pattern"), None);
+        // The git command's own flag, not the first `-C` anywhere in the line.
+        assert_eq!(
+            git_dash_c_target("echo hi; git -C /repo push"),
+            Some("/repo".to_string())
+        );
+        assert_eq!(git_dash_c_target("git status"), None);
     }
 
     #[test]
