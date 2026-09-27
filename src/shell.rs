@@ -53,8 +53,11 @@ pub fn parse(line: &str) -> Vec<Command> {
     let mut escaped = false;
 
     let mut chars = line.chars().peekable();
-    // `by_ref` keeps `chars` available for the lookahead that later tasks add.
-    for ch in chars.by_ref() {
+    // `while let` rather than `for` because the loop body needs `peek` and
+    // `next` to recognise two-character operators such as `>&` and `$(`, which
+    // clippy's `while_let_on_iterator` would otherwise forbid.
+    #[allow(clippy::while_let_on_iterator)]
+    while let Some(ch) = chars.next() {
         // A backslash quotes the next character, except inside single quotes
         // where it is literal.
         if escaped {
@@ -88,8 +91,22 @@ pub fn parse(line: &str) -> Vec<Command> {
                     quote = ch;
                     in_word = true;
                 }
-                '>' => {
+                '&' if chars.peek() == Some(&'>') => {
+                    // `&> file` redirects both streams to a file.
                     current.effects.file_write = true;
+                    end_word(&mut current, &mut word, &mut in_word);
+                }
+                '>' => {
+                    if chars.peek() == Some(&'&') {
+                        // `2>&1` duplicates a descriptor and writes no file. The
+                        // `&` belongs to this operator, so it must be consumed
+                        // rather than read as a control operator that would end
+                        // the command here.
+                        chars.next();
+                        current.effects.descriptor_dup = true;
+                    } else {
+                        current.effects.file_write = true;
+                    }
                     // Flush so a redirect target stays its own word and cannot
                     // be glued to the subcommand: `git log>out.txt` must still
                     // read as `log`.
@@ -157,6 +174,14 @@ mod tests {
             .map(|command| command.args)
             .collect();
         assert_eq!(words, vec![vec!["rg", "foo;bar", "src"]]);
+    }
+
+    #[test]
+    fn descriptor_duplication_is_not_a_file_write() {
+        let command = parse("cargo test 2>&1").remove(0);
+        assert_eq!(command.args, vec!["cargo", "test", "2", "1"]);
+        assert!(command.effects.descriptor_dup);
+        assert!(!command.effects.file_write);
     }
 
     #[test]

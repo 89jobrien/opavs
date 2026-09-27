@@ -706,6 +706,14 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_duplication_is_permitted_in_verification() {
+        assert!(shell_command_allowed("cargo test 2>&1", Phase::Verify));
+        // `git status` is Inspect in every phase, so anything refusing it here
+        // would be refusing the redirection rather than the command.
+        assert!(shell_command_allowed("git status 1>&2", Phase::Orient));
+    }
+
+    #[test]
     fn file_redirection_requires_act() {
         assert!(!shell_command_allowed("rg foo > out.txt", Phase::Verify));
         assert!(!shell_command_allowed("rg foo > out.txt", Phase::Ship));
