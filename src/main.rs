@@ -1,8 +1,10 @@
+//! Command-line interface for OPAVS state, guards, diagnostics, integrations, and upgrades.
+
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use opavs::adapters::{FsPhaseStore, FsTaskStore};
+use opavs::adapters::{FsArtifactReader, FsPhaseStore, FsTaskStore, GitIgnoreQuery};
 use opavs::domain::{self, Phase, PhaseStore, TaskStatus, TaskStore};
-use opavs::{guard, import, init, plugin, repo, upgrade};
+use opavs::{doctor, guard, import, init, plugin, repo, uninstall, upgrade};
 use std::env;
 use std::io::Read;
 use std::path::PathBuf;
@@ -14,6 +16,7 @@ use std::path::PathBuf;
     about = "Orient-Plan-Act-Verify-Ship phase discipline CLI"
 )]
 struct Cli {
+    // TODO(machine-output): Add a stable text/JSON output format for automation clients.
     #[command(subcommand)]
     command: Command,
 }
@@ -37,6 +40,7 @@ enum Command {
     },
     /// PreToolUse hook entrypoint: reads Claude Code hook JSON on stdin,
     /// emits a permissionDecision JSON verdict on stdout.
+    // TODO(guard-explain): Add a direct command that explains guard policy decisions.
     Guard,
     /// Install OPAVS integrations for agent clients.
     Plugin {
@@ -45,6 +49,35 @@ enum Command {
     },
     /// Download and install the newest release from GitHub.
     Upgrade,
+    /// Diagnose repository and client integration state without applying repairs.
+    Doctor {
+        #[arg(default_value = ".")]
+        repo_root: PathBuf,
+        /// Override the home directory inspected for client integrations.
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
+    /// Remove OPAVS client integrations, and optionally this repository's scaffolding.
+    Uninstall {
+        /// Which client integration to remove (defaults to every target).
+        #[arg(long, value_enum, default_value = "all")]
+        target: PluginTarget,
+        /// Override the home directory the removal reads.
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Also remove a repository's OPAVS scaffolding, memory bank, and
+        /// instruction blocks. Requires --repo.
+        #[arg(long)]
+        purge_repo: bool,
+        /// The repository to purge. Mandatory with --purge-repo, and never
+        /// inferred: this deletes a task graph, so it must be named outright
+        /// rather than resolved from the working directory.
+        #[arg(long, requires = "purge_repo")]
+        repo: Option<PathBuf>,
+        /// Report what would be removed without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -90,6 +123,31 @@ enum PluginTarget {
     All,
 }
 
+impl PluginTarget {
+    /// The integration targets this selection names, in installation order.
+    fn resolve(self) -> Vec<plugin::Target> {
+        let one = |target| vec![target];
+        match self {
+            PluginTarget::Claude => one(plugin::Target::Claude),
+            PluginTarget::Codex => one(plugin::Target::Codex),
+            PluginTarget::Gemini => one(plugin::Target::Gemini),
+            PluginTarget::Opencode => one(plugin::Target::Opencode),
+            PluginTarget::All => vec![
+                plugin::Target::Claude,
+                plugin::Target::Codex,
+                plugin::Target::Gemini,
+                plugin::Target::Opencode,
+            ],
+        }
+    }
+}
+
+fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    explicit
+        .or_else(|| env::var("HOME").ok().map(PathBuf::from))
+        .ok_or_else(|| anyhow::anyhow!("unable to resolve home directory; pass --home explicitly"))
+}
+
 fn find_repo_root(explicit: Option<&PathBuf>) -> Result<PathBuf> {
     let start = match explicit {
         Some(p) => p.clone(),
@@ -119,6 +177,7 @@ fn main() -> Result<()> {
             match action {
                 PhaseAction::Get => println!("{}", store.get()?),
                 PhaseAction::Set { phase } => {
+                    // TODO(phase-transitions): Optionally enforce approved phase edges and verification receipts.
                     let phase = Phase::parse(&phase)?;
                     store.set(phase)?;
                     println!("opavs phase -> {phase}");
@@ -177,33 +236,11 @@ fn main() -> Result<()> {
         Command::Guard => run_guard()?,
         Command::Plugin { action } => match action {
             PluginAction::Install { target, home } => {
-                let home = home
-                    .or_else(|| env::var("HOME").ok().map(PathBuf::from))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("unable to resolve home directory; pass --home explicitly")
-                    })?;
+                let home = resolve_home(home)?;
 
-                let targets: Vec<plugin::Target> = match target {
-                    PluginTarget::Claude => vec![plugin::Target::Claude],
-                    PluginTarget::Codex => vec![plugin::Target::Codex],
-                    PluginTarget::Gemini => vec![plugin::Target::Gemini],
-                    PluginTarget::Opencode => vec![plugin::Target::Opencode],
-                    PluginTarget::All => vec![
-                        plugin::Target::Claude,
-                        plugin::Target::Codex,
-                        plugin::Target::Gemini,
-                        plugin::Target::Opencode,
-                    ],
-                };
-
-                for t in targets {
+                for t in target.resolve() {
                     let changed = plugin::install(t, &home)?;
-                    let label = match t {
-                        plugin::Target::Claude => "claude",
-                        plugin::Target::Codex => "codex",
-                        plugin::Target::Gemini => "gemini",
-                        plugin::Target::Opencode => "opencode",
-                    };
+                    let label = t.as_str();
                     if changed.is_empty() {
                         println!("{label}: already up to date");
                     } else {
@@ -223,9 +260,102 @@ fn main() -> Result<()> {
                 println!("opavs {version} is already up to date")
             }
         },
+        Command::Doctor { repo_root, home } => {
+            let home = resolve_home(home)?;
+            let report = doctor::inspect(
+                &FsArtifactReader,
+                &GitIgnoreQuery,
+                &plugin::PluginCatalog,
+                &repo_root,
+                &home,
+            )?;
+            render_doctor_report(&report);
+            if report.has_errors() {
+                bail!("doctor found errors");
+            }
+        }
+        Command::Uninstall {
+            target,
+            home,
+            purge_repo,
+            repo,
+            dry_run,
+        } => {
+            let home = resolve_home(home)?;
+            let mut report = uninstall::Report::default();
+            for t in target.resolve() {
+                report.merge(uninstall::remove_target(t, &home, !dry_run)?);
+            }
+            if purge_repo {
+                let repo_root = repo.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--purge-repo deletes a task graph, so it needs an explicit --repo <path>"
+                    )
+                })?;
+                report.merge(uninstall::purge_repo(&repo_root, !dry_run)?);
+            }
+            render_uninstall_report(&report, dry_run);
+
+            println!(
+                "remove the executable with: cargo install --uninstall --name {}",
+                env!("CARGO_PKG_NAME")
+            );
+        }
     }
 
     Ok(())
+}
+
+fn render_doctor_report(report: &doctor::DoctorReport) {
+    for finding in &report.findings {
+        println!("{:?}\t{}\t{}", finding.level, finding.code, finding.message);
+        if let Some(repair) = &finding.repair {
+            match repair {
+                doctor::RepairAction::RunInit { repo_root, .. } => {
+                    println!(
+                        "  repair: opavs init {}",
+                        shell_quote(&repo_root.display().to_string())
+                    );
+                }
+                doctor::RepairAction::InstallPlugin { target, home, .. } => {
+                    println!(
+                        "  repair: opavs plugin install {} --home {}",
+                        target.as_str(),
+                        shell_quote(&home.display().to_string())
+                    );
+                }
+                doctor::RepairAction::Manual { description, .. } => {
+                    println!("  repair: {description}");
+                }
+                _ => println!("  repair: update opavs for this repair action"),
+            }
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn render_uninstall_report(report: &uninstall::Report, dry_run: bool) {
+    let verb = if dry_run { "would remove" } else { "removed" };
+    let edited_verb = if dry_run { "would edit" } else { "edited" };
+
+    if report.is_empty() {
+        println!("nothing to remove");
+        return;
+    }
+    for path in &report.removed {
+        println!("{verb} {path}");
+    }
+    for path in &report.edited {
+        println!("{edited_verb} {path} (kept surrounding configuration)");
+    }
+    for path in &report.preserved {
+        println!(
+            "kept {path} (modified after install; delete it yourself if you no longer want it)"
+        );
+    }
 }
 
 /// What a PreToolUse hook call resolves to before any repo/phase lookup:
@@ -282,7 +412,8 @@ fn parse_guard_request(hook: &serde_json::Value, session_cwd: &str) -> GuardRequ
                 .pointer("/tool_input/command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let target_dir = extract_dash_c_target(cmd).unwrap_or_else(|| session_cwd.to_string());
+            let target_dir =
+                guard::git_dash_c_target(cmd).unwrap_or_else(|| session_cwd.to_string());
             GuardRequest::Check {
                 tool: "Bash".to_string(),
                 target_dir,
@@ -370,28 +501,27 @@ fn run_guard() -> Result<()> {
     Ok(())
 }
 
-/// Extract the path argument to a `git -C <path>` flag, if present.
-fn extract_dash_c_target(cmd: &str) -> Option<String> {
-    let words: Vec<&str> = cmd.split_whitespace().collect();
-    let pos = words.iter().position(|w| *w == "-C")?;
-    words.get(pos + 1).map(|s| s.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn extracts_dash_c_target() {
-        assert_eq!(
-            extract_dash_c_target("git -C /repo push origin main"),
-            Some("/repo".to_string())
-        );
+    fn bash_with_non_git_dash_c_keeps_the_session_cwd() {
+        let hook = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "rg -C 3 pattern"},
+            "cwd": "/repo",
+        });
+
+        match parse_guard_request(&hook, "/repo") {
+            GuardRequest::Check { target_dir, .. } => assert_eq!(target_dir, "/repo"),
+            GuardRequest::Allow => panic!("expected a check"),
+        }
     }
 
     #[test]
-    fn no_dash_c_target_returns_none() {
-        assert_eq!(extract_dash_c_target("git commit -m x"), None);
+    fn shell_quote_handles_spaces_and_apostrophes() {
+        assert_eq!(shell_quote("a b'c"), "'a b'\"'\"'c'");
     }
 
     fn edit_hook(file_path: &str) -> serde_json::Value {
@@ -561,24 +691,6 @@ mod proptests {
     use proptest::prelude::*;
 
     proptest! {
-        /// No arbitrary UTF-8 input may panic the extractor.
-        #[test]
-        fn extract_dash_c_target_never_panics(cmd in ".*") {
-            let _ = extract_dash_c_target(&cmd);
-        }
-
-        /// When "-C <target>" appears anywhere, it must be extracted verbatim,
-        /// regardless of what surrounds it.
-        #[test]
-        fn extracts_the_word_following_dash_c(
-            prefix in "[a-zA-Z ]{0,10}",
-            target in "[a-zA-Z0-9/_-]{1,10}",
-            suffix in "[a-zA-Z ]{0,10}"
-        ) {
-            let cmd = format!("{prefix} -C {target} {suffix}");
-            prop_assert_eq!(extract_dash_c_target(&cmd), Some(target));
-        }
-
         /// Arbitrary JSON values must never panic hook parsing, regardless of
         /// tool_name/tool_input shape.
         #[test]

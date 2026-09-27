@@ -1,3 +1,5 @@
+//! Fuzzes external task-graph YAML parsing and serialization round trips.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
