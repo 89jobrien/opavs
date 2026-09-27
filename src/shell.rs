@@ -38,27 +38,69 @@ impl Command {
     }
 }
 
-/// Split a compound shell line into its commands at unquoted control operators.
+/// Split a compound shell line into its commands, honouring quoting.
+///
+/// A delimiter only separates commands when the shell would treat it as one, so
+/// this tracks single-quoted, double-quoted, and escaped state. Single quotes make
+/// everything literal. Double quotes still expand `$`, backtick, and `\`, which
+/// later tasks rely on.
 pub fn parse(line: &str) -> Vec<Command> {
     let mut commands: Vec<Command> = Vec::new();
     let mut current = Command::default();
     let mut word = String::new();
     let mut in_word = false;
+    let mut quote = '\0';
+    let mut escaped = false;
 
-    for ch in line.chars() {
-        match ch {
-            ';' | '&' | '|' | '\n' => {
-                end_word(&mut current, &mut word, &mut in_word);
-                if !current.is_empty() {
-                    commands.push(std::mem::take(&mut current));
+    let mut chars = line.chars().peekable();
+    // `by_ref` keeps `chars` available for the lookahead that later tasks add.
+    for ch in chars.by_ref() {
+        // A backslash quotes the next character, except inside single quotes
+        // where it is literal.
+        if escaped {
+            word.push(ch);
+            in_word = true;
+            escaped = false;
+            continue;
+        }
+
+        match quote {
+            // Single quotes make everything literal, metacharacters included.
+            '\'' => {
+                if ch == '\'' {
+                    quote = '\0';
+                } else {
+                    word.push(ch);
+                    in_word = true;
                 }
-                current = Command::default();
             }
-            c if c.is_whitespace() => end_word(&mut current, &mut word, &mut in_word),
-            c => {
-                word.push(c);
-                in_word = true;
-            }
+            '"' => match ch {
+                '"' => quote = '\0',
+                '\\' => escaped = true,
+                _ => {
+                    word.push(ch);
+                    in_word = true;
+                }
+            },
+            _ => match ch {
+                '\\' => escaped = true,
+                '\'' | '"' => {
+                    quote = ch;
+                    in_word = true;
+                }
+                ';' | '&' | '|' | '\n' => {
+                    end_word(&mut current, &mut word, &mut in_word);
+                    if !current.is_empty() {
+                        commands.push(std::mem::take(&mut current));
+                    }
+                    current = Command::default();
+                }
+                c if c.is_whitespace() => end_word(&mut current, &mut word, &mut in_word),
+                c => {
+                    word.push(c);
+                    in_word = true;
+                }
+            },
         }
     }
 
@@ -88,6 +130,27 @@ mod tests {
             .collect();
         assert_eq!(words, vec![vec!["git", "status"], vec!["git", "log"]]);
     }
+
+    #[test]
+    fn quoting_keeps_delimiters_inside_a_word() {
+        let words: Vec<Vec<String>> = parse("rg \"foo;bar\" src")
+            .into_iter()
+            .map(|command| command.args)
+            .collect();
+        assert_eq!(words, vec![vec!["rg", "foo;bar", "src"]]);
+
+        let words: Vec<Vec<String>> = parse("rg 'a|b' src")
+            .into_iter()
+            .map(|command| command.args)
+            .collect();
+        assert_eq!(words, vec![vec!["rg", "a|b", "src"]]);
+
+        let words: Vec<Vec<String>> = parse("rg foo\\;bar src")
+            .into_iter()
+            .map(|command| command.args)
+            .collect();
+        assert_eq!(words, vec![vec!["rg", "foo;bar", "src"]]);
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +163,27 @@ mod proptests {
         #[test]
         fn parse_never_panics(line in ".*") {
             let _ = parse(&line);
+        }
+
+        /// A delimiter inside quotes belongs to the word, never the command line.
+        #[test]
+        fn quoted_delimiters_never_split(word in "[a-zA-Z0-9]{1,8}") {
+            let commands = parse(&format!("'{word};{word}'"));
+            prop_assert_eq!(commands.len(), 1);
+            prop_assert_eq!(&commands[0].args, &vec![format!("{word};{word}")]);
+
+            let commands = parse(&format!("\"{word}|{word}\""));
+            prop_assert_eq!(commands.len(), 1);
+            prop_assert_eq!(&commands[0].args, &vec![format!("{word}|{word}")]);
+        }
+
+        /// Quoting a bare word cannot change how many commands the line holds.
+        #[test]
+        fn quoting_never_splits_a_command(word in "[a-zA-Z0-9_./-]{1,12}") {
+            let bare = parse(&word);
+            let quoted = parse(&format!("'{word}'"));
+            prop_assert_eq!(bare.len(), quoted.len());
+            prop_assert_eq!(&bare[0].args, &quoted[0].args);
         }
     }
 }
