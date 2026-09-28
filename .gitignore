@@ -1,4 +1,5 @@
 /target
+.taskit/
 .ctx/opavs/phase
 .ctx/.opavs-phase
 /fuzz/target
